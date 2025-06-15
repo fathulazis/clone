@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-events.py – live-events playlist with tv-logo repo artwork
+events.py – build live-events playlist with tv-logo repo artwork
 """
 
 import argparse
@@ -11,7 +11,6 @@ import time
 import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 import requests
 
@@ -20,9 +19,8 @@ SCHEDULE_URL = "https://daddylive.dad/schedule/schedule-generated.php"
 PROXY_PREFIX = "https://josh9456-ddproxy.hf.space/watch/"
 OUTPUT_FILE  = "schedule_playlist.m3u8"
 
-TVLOGO_RAW_ROOT = (
-    "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/"
-)
+TVLOGO_RAW_ROOT = "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/"
+TVLOGO_API_ROOT = "https://api.github.com/repos/tv-logo/tv-logos/contents/countries"
 
 URL_TEMPLATES = [
     "https://nfsnew.newkso.ru/nfs/premium{num}/mono.m3u8",
@@ -50,104 +48,88 @@ VLC_HEADERS = [
     "Mobile/15E148 Safari/604.1",
 ]
 
-GENERIC_LOGO = (
-    "https://raw.githubusercontent.com/tv-logo/tv-logos/main/unknown.png"
-)  # safe fallback
-
-COUNTRY_HINTS = {
-    "usa": "united-states",
-    "us": "united-states",
-    "uk": "united-kingdom",
-    "canada": "canada",
-    "au": "australia",
-    "aus": "australia",
-    "australia": "australia",
-    "nz": "new-zealand",
-    "new zealand": "new-zealand",
-    "my": "malaysia",
-    "mys": "malaysia",
-}
-
-
 # ─── helpers ────────────────────────────────────────────────
 def slugify(channel: str) -> str:
-    """Turn channel name into tv-logo style slug (lowercase, hyphens, “and”, cc)."""
-    txt = (
-        unicodedata.normalize("NFKD", channel)
-        .encode("ascii", "ignore")
-        .decode()
-        .lower()
-    )
-    txt = txt.replace("&", " and ")
+    """Convert channel name to lowercase slug with hyphens."""
+    txt = unicodedata.normalize("NFKD", channel).encode("ascii", "ignore").decode().lower()
+    txt = txt.replace("&", "-and-").replace("+", "-plus-")
     txt = re.sub(r"[^\w\s-]", "", txt)
     txt = re.sub(r"\s+", "-", txt).strip("-")
-    return txt + ".png"
+    return txt
 
+def build_comprehensive_logo_index(session: requests.Session) -> dict:
+    """Build complete logo index from tv-logo repo."""
+    logging.info("Building comprehensive logo index from tv-logo repo...")
+    logo_index = {}
+    
+    # Get all country directories
+    r = session.get(TVLOGO_API_ROOT, timeout=30)
+    r.raise_for_status()
+    countries = [item["name"] for item in r.json() if item["type"] == "dir"]
+    
+    logging.info("Found %d countries in logo repo", len(countries))
+    
+    # For each country, get all logo files
+    for country in countries:
+        try:
+            country_url = f"{TVLOGO_API_ROOT}/{country}"
+            r = session.get(country_url, timeout=30)
+            r.raise_for_status()
+            
+            for file_info in r.json():
+                if file_info["type"] == "file" and file_info["name"].endswith(".png"):
+                    filename = file_info["name"]
+                    full_url = f"{TVLOGO_RAW_ROOT}{country}/{filename}"
+                    
+                    # Store multiple variations for flexible matching
+                    base_name = filename.replace(".png", "")
+                    logo_index[filename] = full_url
+                    logo_index[base_name] = full_url
+                    
+                    # Also store without country suffix for broader matching
+                    for suffix in ["-us", "-uk", "-ca", "-au", "-de", "-fr", "-es", "-it"]:
+                        if base_name.endswith(suffix):
+                            clean_name = base_name.replace(suffix, "")
+                            logo_index[clean_name] = full_url
+                            logo_index[clean_name + ".png"] = full_url
+                    
+        except Exception as e:
+            logging.debug("Failed to fetch logos for %s: %s", country, e)
+            continue
+    
+    logging.info("✓ Logo index built with %d entries", len(logo_index))
+    return logo_index
 
-def get_country_folder(name: str) -> str | None:
-    key = name.lower().replace(" ", " ").strip()
-    for k, folder in COUNTRY_HINTS.items():
-        if k in key:
-            return folder
-    return None
-
-
-def build_logo_index(session: requests.Session) -> set[str]:
-    """Download **once** the list of all logo paths in the repo."""
-    logging.info("Fetching full logo index (GitHub API pagination)…")
-    index = set()
-    page = 1
-    while True:
-        api_url = (
-            "https://api.github.com/repos/tv-logo/tv-logos/contents/countries"
-            f"?per_page=100&page={page}"
-        )
-        r = session.get(api_url, timeout=15)
-        r.raise_for_status()
-        items = r.json()
-        if not items:
-            break
-        for country in items:
-            if country["type"] != "dir":
-                continue
-            country_dir = country["path"]
-            # fetch each country dir (max 1000 files per dir is fine)
-            r2 = session.get(
-                f"https://api.github.com/repos/tv-logo/tv-logos/contents/{country_dir}",
-                timeout=30,
-            )
-            r2.raise_for_status()
-            for f in r2.json():
-                if f["type"] == "file" and f["name"].endswith(".png"):
-                    index.add(f["path"])
-        page += 1
-    logging.info("✓ logo index ready (%d files)", len(index))
-    return index
-
-
-def find_logo(channel_name: str, index: set[str]) -> str:
+def find_best_logo(channel_name: str, logo_index: dict) -> str:
+    """Find the best matching logo for a channel name."""
     slug = slugify(channel_name)
-    # 1. try with country hint
-    if folder := get_country_folder(channel_name):
-        path = f"{folder}/{slug}"
-        if f"countries/{path}" in index:
-            return TVLOGO_RAW_ROOT + path
-    # 2. brute-search (rare, but still quick with in-memory set)
-    for p in index:
-        if p.endswith("/" + slug):
-            return TVLOGO_RAW_ROOT + "/".join(p.split("/")[1:])
-    return GENERIC_LOGO
+    
+    # Try multiple variations
+    variations = [
+        slug,
+        slug + ".png",
+        slug.replace("-hd", ""),
+        slug.replace("-sd", ""),
+        slug.split("-")[0],  # Just first word
+        channel_name.lower().replace(" ", "-"),
+        channel_name.lower().replace(" ", "-") + ".png",
+    ]
+    
+    for variant in variations:
+        if variant in logo_index:
+            logging.debug("✓ Logo found for %s: %s", channel_name, variant)
+            return logo_index[variant]
+    
+    # Fallback to generic logo
+    return "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/no-logo.png"
 
-
-def get_schedule() -> dict:
+def get_schedule():
     r = requests.get(SCHEDULE_URL, headers=HEADERS, timeout=15)
     r.raise_for_status()
     return r.json()
 
-
 def _extract_cid(item):
     return str(item["channel_id"]) if isinstance(item, dict) else str(item)
-
 
 def _channel_entries(event):
     for key in ("channels", "channels2"):
@@ -157,10 +139,12 @@ def _channel_entries(event):
         if isinstance(val, list):
             yield from val
         elif isinstance(val, dict):
-            yield from val.values() if "channel_id" not in val else [val]
+            if "channel_id" in val:
+                yield val
+            else:
+                yield from val.values()
         else:
             yield val
-
 
 def extract_channel_ids(schedule):
     ids = set()
@@ -170,14 +154,13 @@ def extract_channel_ids(schedule):
                 ids.update(_extract_cid(ch) for ch in _channel_entries(ev))
     return ids
 
-
 def validate_single(url):
     for _ in range(3):
         try:
             r = requests.head(url, headers=HEADERS, timeout=10, allow_redirects=True)
             if r.status_code == 200:
                 return url
-            if r.status_code in (404,):
+            if r.status_code == 404:
                 return None
             if r.status_code == 429:
                 time.sleep(5)
@@ -191,7 +174,6 @@ def validate_single(url):
             return None
     return None
 
-
 def build_stream_map(channel_ids, workers=20):
     candidates = {tpl.format(num=i): i for i in channel_ids for tpl in URL_TEMPLATES}
     id_to_url = {}
@@ -203,7 +185,6 @@ def build_stream_map(channel_ids, workers=20):
                 id_to_url.setdefault(candidates[res], res)
     logging.info("✓ %d working streams", len(id_to_url))
     return id_to_url
-
 
 def make_playlist(schedule, stream_map, logo_index):
     lines = ["#EXTM3U"]
@@ -222,7 +203,7 @@ def make_playlist(schedule, stream_map, logo_index):
                 if not stream:
                     continue
 
-                logo_url = find_logo(cname, logo_index)
+                logo_url = find_best_logo(cname, logo_index)
                 extinf = (
                     f'#EXTINF:-1 tvg-id="{cid}" '
                     f'tvg-logo="{logo_url}" '
@@ -236,13 +217,12 @@ def make_playlist(schedule, stream_map, logo_index):
                 lines.extend(VLC_HEADERS)
                 lines.append(proxy)
 
-    Path(OUTPUT_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
+        fp.write("\n".join(lines) + "\n")
     logging.info("Playlist written to %s (%d events)", OUTPUT_FILE, (len(lines) - 1) // 5)
 
-
-# ─── main ───────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Build live-events playlist with logos")
+    ap = argparse.ArgumentParser(description="Build live-events playlist with comprehensive logos")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -255,10 +235,9 @@ def main():
     chan_ids = extract_channel_ids(schedule)
     stream_map = build_stream_map(chan_ids)
 
-    with requests.Session() as s:
-        logo_index = build_logo_index(s)
+    with requests.Session() as session:
+        logo_index = build_comprehensive_logo_index(session)
         make_playlist(schedule, stream_map, logo_index)
-
 
 if __name__ == "__main__":
     main()
