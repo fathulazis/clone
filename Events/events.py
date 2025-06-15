@@ -5,6 +5,7 @@ events.py – build live-events playlist with tv-logo repo artwork and EPG match
 
 import argparse
 import base64
+import gzip
 import logging
 import re
 import time
@@ -19,7 +20,7 @@ import requests
 SCHEDULE_URL = "https://daddylive.dad/schedule/schedule-generated.php"
 PROXY_PREFIX = "https://josh9456-ddproxy.hf.space/watch/"
 OUTPUT_FILE  = "schedule_playlist.m3u8"
-EPG_URL = "https://bit.ly/a1xepg"
+EPG_URL = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
 
 TVLOGO_RAW_ROOT = "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/"
 TVLOGO_API_ROOT = "https://api.github.com/repos/tv-logo/tv-logos/contents/countries"
@@ -63,22 +64,28 @@ def normalize_channel_name(name: str) -> str:
     """Normalize channel name for EPG matching."""
     name = name.upper().strip()
     # Remove common suffixes that might interfere with matching
-    suffixes = [" HD", " SD", " US", " UK", " CA", " AU", " DE", " FR", " ES", " IT"]
+    suffixes = [" HD", " SD", " US", " UK", " CA", " AU", " DE", " FR", " ES", " IT", " NL"]
     for suffix in suffixes:
         if name.endswith(suffix):
             name = name[:-len(suffix)]
     return re.sub(r'[^\w\s]', '', name).strip()
 
 def download_and_parse_epg(session: requests.Session) -> dict:
-    """Download and parse EPG XML to build channel mapping."""
-    logging.info("Downloading EPG from %s...", EPG_URL)
+    """Download and parse compressed EPG XML to build channel mapping."""
+    logging.info("Downloading compressed EPG from %s...", EPG_URL)
     
     try:
-        r = session.get(EPG_URL, timeout=60)
+        r = session.get(EPG_URL, timeout=120)  # Longer timeout for large file
         r.raise_for_status()
         
+        logging.info("✓ EPG downloaded (%d bytes), decompressing...", len(r.content))
+        
+        # Decompress gzip content
+        xml_content = gzip.decompress(r.content)
+        logging.info("✓ EPG decompressed (%d bytes)", len(xml_content))
+        
         # Parse XML
-        root = ET.fromstring(r.content)
+        root = ET.fromstring(xml_content)
         epg_channels = {}
         
         # Extract channel information from XMLTV format
@@ -93,6 +100,8 @@ def download_and_parse_epg(session: requests.Session) -> dict:
                     epg_channels[normalized] = channel_id
                     # Also store the original name
                     epg_channels[name.upper().strip()] = channel_id
+                    # Store lowercase version too
+                    epg_channels[name.lower().strip()] = channel_id
         
         logging.info("✓ EPG parsed with %d channel mappings", len(epg_channels))
         return epg_channels
@@ -107,25 +116,27 @@ def find_epg_id(channel_name: str, epg_channels: dict) -> str:
         return ""
     
     normalized = normalize_channel_name(channel_name)
+    original_upper = channel_name.upper().strip()
+    original_lower = channel_name.lower().strip()
     
-    # Direct match
-    if normalized in epg_channels:
-        return epg_channels[normalized]
-    
-    # Try original name
-    if channel_name.upper().strip() in epg_channels:
-        return epg_channels[channel_name.upper().strip()]
+    # Direct matches first
+    for candidate in [normalized, original_upper, original_lower]:
+        if candidate in epg_channels:
+            logging.debug("✓ EPG match for %s: %s", channel_name, epg_channels[candidate])
+            return epg_channels[candidate]
     
     # Fuzzy matching - find partial matches
     for epg_name, epg_id in epg_channels.items():
         if normalized in epg_name or epg_name in normalized:
+            logging.debug("✓ EPG fuzzy match for %s: %s", channel_name, epg_id)
             return epg_id
     
     # Try just the first word
     first_word = normalized.split()[0] if normalized.split() else ""
-    if first_word:
+    if first_word and len(first_word) > 2:  # Only if meaningful word
         for epg_name, epg_id in epg_channels.items():
-            if first_word in epg_name:
+            if first_word in epg_name.lower():
+                logging.debug("✓ EPG first-word match for %s: %s", channel_name, epg_id)
                 return epg_id
     
     return ""
@@ -278,6 +289,9 @@ def make_playlist(schedule, stream_map, logo_index, epg_channels):
         for cat, events in cats.items():
             grouped[cat.upper()].extend(events)
 
+    epg_matches = 0
+    total_entries = 0
+
     for group in sorted(grouped):
         for ev in grouped[group]:
             title = ev["event"]
@@ -288,8 +302,12 @@ def make_playlist(schedule, stream_map, logo_index, epg_channels):
                 if not stream:
                     continue
 
+                total_entries += 1
+                
                 # Find EPG ID
                 epg_id = find_epg_id(cname, epg_channels)
+                if epg_id:
+                    epg_matches += 1
                 tvg_id = epg_id if epg_id else cid
                 
                 logo_url = find_best_logo(cname, logo_index)
@@ -308,7 +326,9 @@ def make_playlist(schedule, stream_map, logo_index, epg_channels):
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
         fp.write("\n".join(lines) + "\n")
-    logging.info("Playlist written to %s (%d events)", OUTPUT_FILE, (len(lines) - 2) // 5)  # -2 for header lines
+    
+    logging.info("Playlist written to %s (%d events, %d EPG matches)", 
+                 OUTPUT_FILE, total_entries, epg_matches)
 
 def main():
     ap = argparse.ArgumentParser(description="Build live-events playlist with logos and EPG")
