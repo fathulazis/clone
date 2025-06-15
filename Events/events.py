@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-events.py – build live-events playlist with tv-logo repo artwork and EPG matching
+events.py – build live-events playlist with tv-logo repo artwork and lightweight EPG ID mapping
 """
 
 import argparse
 import base64
-import gzip
 import logging
 import re
 import time
 import unicodedata
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -20,7 +18,10 @@ import requests
 SCHEDULE_URL = "https://daddylive.dad/schedule/schedule-generated.php"
 PROXY_PREFIX = "https://josh9456-ddproxy.hf.space/watch/"
 OUTPUT_FILE  = "schedule_playlist.m3u8"
-EPG_URL = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
+
+# Use the lightweight text file for ID mapping, XML for TiviMate EPG data
+EPG_IDS_URL = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.txt"
+EPG_XML_URL = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
 
 TVLOGO_RAW_ROOT = "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/"
 TVLOGO_API_ROOT = "https://api.github.com/repos/tv-logo/tv-logos/contents/countries"
@@ -63,51 +64,48 @@ def slugify(channel: str) -> str:
 def normalize_channel_name(name: str) -> str:
     """Normalize channel name for EPG matching."""
     name = name.upper().strip()
-    # Remove common suffixes that might interfere with matching
     suffixes = [" HD", " SD", " US", " UK", " CA", " AU", " DE", " FR", " ES", " IT", " NL"]
     for suffix in suffixes:
         if name.endswith(suffix):
             name = name[:-len(suffix)]
     return re.sub(r'[^\w\s]', '', name).strip()
 
-def download_and_parse_epg(session: requests.Session) -> dict:
-    """Download and parse compressed EPG XML to build channel mapping."""
-    logging.info("Downloading compressed EPG from %s...", EPG_URL)
+def download_epg_ids_from_txt(session: requests.Session) -> dict:
+    """Download the lightweight text file containing EPG channel IDs."""
+    logging.info("Downloading EPG IDs from text file...")
     
     try:
-        r = session.get(EPG_URL, timeout=120)  # Longer timeout for large file
+        r = session.get(EPG_IDS_URL, timeout=30)
         r.raise_for_status()
         
-        logging.info("✓ EPG downloaded (%d bytes), decompressing...", len(r.content))
+        logging.info("✓ EPG IDs downloaded (%d bytes)", len(r.content))
         
-        # Decompress gzip content
-        xml_content = gzip.decompress(r.content)
-        logging.info("✓ EPG decompressed (%d bytes)", len(xml_content))
-        
-        # Parse XML
-        root = ET.fromstring(xml_content)
         epg_channels = {}
+        lines = r.text.splitlines()
         
-        # Extract channel information from XMLTV format
-        for channel in root.findall('.//channel'):
-            channel_id = channel.get('id', '')
-            display_names = [dn.text for dn in channel.findall('display-name') if dn.text]
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
             
-            if channel_id and display_names:
-                # Store all possible display names for this channel ID
-                for name in display_names:
-                    normalized = normalize_channel_name(name)
-                    epg_channels[normalized] = channel_id
-                    # Also store the original name
-                    epg_channels[name.upper().strip()] = channel_id
-                    # Store lowercase version too
-                    epg_channels[name.lower().strip()] = channel_id
+            # The text file format is typically: "Channel Name" or "tvg-id" per line
+            # We'll treat each line as a potential channel name/ID
+            normalized = normalize_channel_name(line)
+            epg_channels[normalized] = line  # Use original line as TVG ID
+            epg_channels[line.upper().strip()] = line
+            epg_channels[line.lower().strip()] = line
+            
+            # If line contains dots/underscores, also store cleaned version
+            if '.' in line or '_' in line:
+                clean = line.replace('.', ' ').replace('_', ' ')
+                clean_norm = normalize_channel_name(clean)
+                epg_channels[clean_norm] = line
         
-        logging.info("✓ EPG parsed with %d channel mappings", len(epg_channels))
+        logging.info("✓ EPG IDs parsed: %d mappings", len(epg_channels))
         return epg_channels
         
     except Exception as e:
-        logging.warning("Failed to download/parse EPG: %s", e)
+        logging.warning("Failed to download EPG IDs: %s", e)
         return {}
 
 def find_epg_id(channel_name: str, epg_channels: dict) -> str:
@@ -133,7 +131,7 @@ def find_epg_id(channel_name: str, epg_channels: dict) -> str:
     
     # Try just the first word
     first_word = normalized.split()[0] if normalized.split() else ""
-    if first_word and len(first_word) > 2:  # Only if meaningful word
+    if first_word and len(first_word) > 2:
         for epg_name, epg_id in epg_channels.items():
             if first_word in epg_name.lower():
                 logging.debug("✓ EPG first-word match for %s: %s", channel_name, epg_id)
@@ -147,14 +145,12 @@ def build_comprehensive_logo_index(session: requests.Session) -> dict:
     logo_index = {}
     
     try:
-        # Get all country directories
         r = session.get(TVLOGO_API_ROOT, timeout=30)
         r.raise_for_status()
         countries = [item["name"] for item in r.json() if item["type"] == "dir"]
         
         logging.info("Found %d countries in logo repo", len(countries))
         
-        # For each country, get all logo files
         for country in countries:
             try:
                 country_url = f"{TVLOGO_API_ROOT}/{country}"
@@ -166,12 +162,10 @@ def build_comprehensive_logo_index(session: requests.Session) -> dict:
                         filename = file_info["name"]
                         full_url = f"{TVLOGO_RAW_ROOT}{country}/{filename}"
                         
-                        # Store multiple variations for flexible matching
                         base_name = filename.replace(".png", "")
                         logo_index[filename] = full_url
                         logo_index[base_name] = full_url
                         
-                        # Also store without country suffix for broader matching
                         for suffix in ["-us", "-uk", "-ca", "-au", "-de", "-fr", "-es", "-it"]:
                             if base_name.endswith(suffix):
                                 clean_name = base_name.replace(suffix, "")
@@ -195,15 +189,9 @@ def find_best_logo(channel_name: str, logo_index: dict) -> str:
         return "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/no-logo.png"
         
     slug = slugify(channel_name)
-    
-    # Try multiple variations
     variations = [
-        slug,
-        slug + ".png",
-        slug.replace("-hd", ""),
-        slug.replace("-sd", ""),
-        slug.split("-")[0],  # Just first word
-        channel_name.lower().replace(" ", "-"),
+        slug, slug + ".png", slug.replace("-hd", ""), slug.replace("-sd", ""),
+        slug.split("-")[0], channel_name.lower().replace(" ", "-"),
         channel_name.lower().replace(" ", "-") + ".png",
     ]
     
@@ -212,7 +200,6 @@ def find_best_logo(channel_name: str, logo_index: dict) -> str:
             logging.debug("✓ Logo found for %s: %s", channel_name, variant)
             return logo_index[variant]
     
-    # Fallback to generic logo
     return "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/no-logo.png"
 
 def get_schedule():
@@ -281,8 +268,8 @@ def build_stream_map(channel_ids, workers=20):
 def make_playlist(schedule, stream_map, logo_index, epg_channels):
     lines = ["#EXTM3U"]
     
-    # Add EPG URL to playlist header
-    lines.append(f"#EXTM3U url-tvg=\"{EPG_URL}\"")
+    # Use the XML file for TiviMate's EPG data loading
+    lines.append(f"#EXTM3U url-tvg=\"{EPG_XML_URL}\"")
     
     grouped = defaultdict(list)
     for day, cats in schedule.items():
@@ -304,7 +291,6 @@ def make_playlist(schedule, stream_map, logo_index, epg_channels):
 
                 total_entries += 1
                 
-                # Find EPG ID
                 epg_id = find_epg_id(cname, epg_channels)
                 if epg_id:
                     epg_matches += 1
@@ -331,7 +317,7 @@ def make_playlist(schedule, stream_map, logo_index, epg_channels):
                  OUTPUT_FILE, total_entries, epg_matches)
 
 def main():
-    ap = argparse.ArgumentParser(description="Build live-events playlist with logos and EPG")
+    ap = argparse.ArgumentParser(description="Build live-events playlist with logos and lightweight EPG")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -346,7 +332,7 @@ def main():
 
     with requests.Session() as session:
         logo_index = build_comprehensive_logo_index(session)
-        epg_channels = download_and_parse_epg(session)
+        epg_channels = download_epg_ids_from_txt(session)  # ← Much faster!
         make_playlist(schedule, stream_map, logo_index, epg_channels)
 
 if __name__ == "__main__":
