@@ -3,17 +3,22 @@ name: Update Playlist
 
 on:
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 0 * * *'         # runs daily at 00:00 UTC
+  workflow_dispatch:             # manual trigger
+
+# ─── Grant github-actions[bot] write access ───────────────────────────────────
+permissions:
+  contents: write                # allows commits / pushes
 
 jobs:
   automate:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0
+          fetch-depth: 0         # pull full history so git commit works properly
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -28,11 +33,12 @@ jobs:
           cd all_channels
           python main.py
 
-      - name: Commit and push
+      - name: Commit and push changes
         run: |
           cd all_channels
-          git config --global user.name "actions-user"
+          git config --global user.name  "actions-user"
           git config --global user.email "actions@github.com"
-          git add tivimate_playlist.m3u8 links.m3u8 
+          git add tivimate_playlist.m3u8 links.m3u8
           git diff --staged --quiet || git commit -m "Automated playlist update"
           git push --force
+
