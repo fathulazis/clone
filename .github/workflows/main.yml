@@ -15,11 +15,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download channels.m3u8
-        run: |
-          cd all_channels
-          curl -sSL https://josh9456-myproxy.hf.space/playlist/channels -o channels.m3u8
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -38,6 +33,6 @@ jobs:
           cd all_channels
           git config --global user.name "actions-user"
           git config --global user.email "actions@github.com"
-          git add tivimate_playlist.m3u8 links.m3u8 channels.m3u8
+          git add tivimate_playlist.m3u8 links.m3u8 
           git diff --staged --quiet || git commit -m "Automated playlist update"
           git push --force
