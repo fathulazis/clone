@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
-events.py ─ build a DaddyLive “live events” playlist
-
-• pulls the JSON schedule
-• validates every candidate stream (same logic you already use)
-• keeps **only English-speaking feeds** (USA, UK, Canada, Australia,
-  New Zealand, Malaysia)
-• auto-adds a tvg-logo if a file with the channel slug exists in the
-  iptv-org/logo repo
-• writes one 4-line block per event to schedule_playlist.m3u8
-• ‑v / --verbose prints DEBUG detail
+events.py – live-events playlist with tv-logo repo artwork
 """
 
 import argparse
@@ -20,14 +11,18 @@ import time
 import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
+from pathlib import Path
 
 import requests
 
-# ───── constants ──────────────────────────────────────────────────────
-SCHEDULE_URL  = "https://daddylive.dad/schedule/schedule-generated.php"
-PROXY_PREFIX  = "https://josh9456-ddproxy.hf.space/watch/"
-OUTPUT_FILE   = "schedule_playlist.m3u8"
+# ─── constants ──────────────────────────────────────────────
+SCHEDULE_URL = "https://daddylive.dad/schedule/schedule-generated.php"
+PROXY_PREFIX = "https://josh9456-ddproxy.hf.space/watch/"
+OUTPUT_FILE  = "schedule_playlist.m3u8"
+
+TVLOGO_RAW_ROOT = (
+    "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/"
+)
 
 URL_TEMPLATES = [
     "https://nfsnew.newkso.ru/nfs/premium{num}/mono.m3u8",
@@ -38,9 +33,10 @@ URL_TEMPLATES = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/137.0.0.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+    ),
     "Referer": "https://daddylive.dad/24-7-channels.php",
     "Accept": "application/json, text/javascript, */*; q=0.01",
 }
@@ -54,70 +50,126 @@ VLC_HEADERS = [
     "Mobile/15E148 Safari/604.1",
 ]
 
-# countries whose channels we want to keep
-ALLOWED_COUNTRY_KEYWORDS = {
-    "USA", "US", "UK", "EN", "ENG", "CAN", "CANADA",
-    "AU", "AUS", "AUSTRALIA", "NZ", "NEWZEALAND", "MYS", "MY", "MALAYSIA"
+GENERIC_LOGO = (
+    "https://raw.githubusercontent.com/tv-logo/tv-logos/main/unknown.png"
+)  # safe fallback
+
+COUNTRY_HINTS = {
+    "usa": "united-states",
+    "us": "united-states",
+    "uk": "united-kingdom",
+    "canada": "canada",
+    "au": "australia",
+    "aus": "australia",
+    "australia": "australia",
+    "nz": "new-zealand",
+    "new zealand": "new-zealand",
+    "my": "malaysia",
+    "mys": "malaysia",
 }
 
-LOGO_RAW = "https://raw.githubusercontent.com/iptv-org/logos/master/tv/{slug}.png"
 
-# ───── helpers ────────────────────────────────────────────────────────
-def slugify(name: str) -> str:
-    text = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
-    text = re.sub(r"[^\w\s-]", "", text).lower()
-    text = re.sub(r"\s+", "-", text).strip("-")
-    return text
+# ─── helpers ────────────────────────────────────────────────
+def slugify(channel: str) -> str:
+    """Turn channel name into tv-logo style slug (lowercase, hyphens, “and”, cc)."""
+    txt = (
+        unicodedata.normalize("NFKD", channel)
+        .encode("ascii", "ignore")
+        .decode()
+        .lower()
+    )
+    txt = txt.replace("&", " and ")
+    txt = re.sub(r"[^\w\s-]", "", txt)
+    txt = re.sub(r"\s+", "-", txt).strip("-")
+    return txt + ".png"
 
-def is_allowed_channel(name: str) -> bool:
-    upper = name.upper().replace(" ", "")
-    return any(k in upper for k in ALLOWED_COUNTRY_KEYWORDS)
 
-@lru_cache(maxsize=None)
-def logo_exists(slug: str, session: requests.Session) -> bool:
-    url = LOGO_RAW.format(slug=slug)
-    try:
-        r = session.head(url, timeout=10)
-        return r.status_code == 200
-    except requests.RequestException:
-        return False
+def get_country_folder(name: str) -> str | None:
+    key = name.lower().replace(" ", " ").strip()
+    for k, folder in COUNTRY_HINTS.items():
+        if k in key:
+            return folder
+    return None
 
-def get_schedule():
-    logging.info("Fetching schedule JSON …")
+
+def build_logo_index(session: requests.Session) -> set[str]:
+    """Download **once** the list of all logo paths in the repo."""
+    logging.info("Fetching full logo index (GitHub API pagination)…")
+    index = set()
+    page = 1
+    while True:
+        api_url = (
+            "https://api.github.com/repos/tv-logo/tv-logos/contents/countries"
+            f"?per_page=100&page={page}"
+        )
+        r = session.get(api_url, timeout=15)
+        r.raise_for_status()
+        items = r.json()
+        if not items:
+            break
+        for country in items:
+            if country["type"] != "dir":
+                continue
+            country_dir = country["path"]
+            # fetch each country dir (max 1000 files per dir is fine)
+            r2 = session.get(
+                f"https://api.github.com/repos/tv-logo/tv-logos/contents/{country_dir}",
+                timeout=30,
+            )
+            r2.raise_for_status()
+            for f in r2.json():
+                if f["type"] == "file" and f["name"].endswith(".png"):
+                    index.add(f["path"])
+        page += 1
+    logging.info("✓ logo index ready (%d files)", len(index))
+    return index
+
+
+def find_logo(channel_name: str, index: set[str]) -> str:
+    slug = slugify(channel_name)
+    # 1. try with country hint
+    if folder := get_country_folder(channel_name):
+        path = f"{folder}/{slug}"
+        if f"countries/{path}" in index:
+            return TVLOGO_RAW_ROOT + path
+    # 2. brute-search (rare, but still quick with in-memory set)
+    for p in index:
+        if p.endswith("/" + slug):
+            return TVLOGO_RAW_ROOT + "/".join(p.split("/")[1:])
+    return GENERIC_LOGO
+
+
+def get_schedule() -> dict:
     r = requests.get(SCHEDULE_URL, headers=HEADERS, timeout=15)
     r.raise_for_status()
-    logging.info("✓ schedule obtained (%d bytes)", len(r.content))
     return r.json()
 
-def _extract_cid(item):
-    if isinstance(item, dict):
-        return str(item.get("channel_id"))
-    return str(item)
 
-def _channel_entries(ev):
+def _extract_cid(item):
+    return str(item["channel_id"]) if isinstance(item, dict) else str(item)
+
+
+def _channel_entries(event):
     for key in ("channels", "channels2"):
-        val = ev.get(key)
+        val = event.get(key)
         if not val:
             continue
         if isinstance(val, list):
             yield from val
         elif isinstance(val, dict):
-            # mapping (idx → obj) or single object
-            if "channel_id" in val:
-                yield val
-            else:
-                yield from val.values()
+            yield from val.values() if "channel_id" not in val else [val]
         else:
             yield val
+
 
 def extract_channel_ids(schedule):
     ids = set()
     for cats in schedule.values():
         for events in cats.values():
             for ev in events:
-                for ch in _channel_entries(ev):
-                    ids.add(_extract_cid(ch))
+                ids.update(_extract_cid(ch) for ch in _channel_entries(ev))
     return ids
+
 
 def validate_single(url):
     for _ in range(3):
@@ -125,12 +177,11 @@ def validate_single(url):
             r = requests.head(url, headers=HEADERS, timeout=10, allow_redirects=True)
             if r.status_code == 200:
                 return url
-            if r.status_code == 404:
+            if r.status_code in (404,):
                 return None
             if r.status_code == 429:
                 time.sleep(5)
                 continue
-            # fallback GET
             r = requests.get(url, headers=HEADERS, timeout=10, stream=True)
             if r.status_code == 200:
                 return url
@@ -140,8 +191,8 @@ def validate_single(url):
             return None
     return None
 
+
 def build_stream_map(channel_ids, workers=20):
-    logging.info("Validating %d×5 candidate URLs …", len(channel_ids))
     candidates = {tpl.format(num=i): i for i in channel_ids for tpl in URL_TEMPLATES}
     id_to_url = {}
     with ThreadPoolExecutor(workers) as pool:
@@ -149,74 +200,65 @@ def build_stream_map(channel_ids, workers=20):
         for fut in as_completed(futures):
             res = fut.result()
             if res:
-                cid = candidates[res]
-                id_to_url.setdefault(cid, res)
-                logging.debug("✓ %s", res)
+                id_to_url.setdefault(candidates[res], res)
     logging.info("✓ %d working streams", len(id_to_url))
     return id_to_url
 
-# ───── playlist builder ───────────────────────────────────────────────
-def make_playlist(schedule, stream_map):
-    logging.info("Assembling playlist (English-speaking channels only)…")
+
+def make_playlist(schedule, stream_map, logo_index):
     lines = ["#EXTM3U"]
     grouped = defaultdict(list)
-
     for day, cats in schedule.items():
         for cat, events in cats.items():
-            for ev in events:
-                grouped[cat.upper()].append(ev)
-
-    session = requests.Session()
+            grouped[cat.upper()].extend(events)
 
     for group in sorted(grouped):
         for ev in grouped[group]:
             title = ev["event"]
             for ch in _channel_entries(ev):
                 cname = ch["channel_name"] if isinstance(ch, dict) else str(ch)
-                if not is_allowed_channel(cname):
-                    continue
-                cid    = _extract_cid(ch)
+                cid = _extract_cid(ch)
                 stream = stream_map.get(cid)
                 if not stream:
                     continue
 
-                slug = slugify(cname)
-                logo_url = LOGO_RAW.format(slug=slug) if logo_exists(slug, session) else ""
-
-                extinf = f'#EXTINF:-1 tvg-id="{cid}" '
-                if logo_url:
-                    extinf += f'tvg-logo="{logo_url}" '
-                extinf += f'group-title="{group}",{title} ({cname})'
+                logo_url = find_logo(cname, logo_index)
+                extinf = (
+                    f'#EXTINF:-1 tvg-id="{cid}" '
+                    f'tvg-logo="{logo_url}" '
+                    f'group-title="{group}",{title} ({cname})'
+                )
 
                 encoded = base64.b64encode(stream.encode()).decode()
-                proxy   = f"{PROXY_PREFIX}{encoded}.m3u8"
+                proxy = f"{PROXY_PREFIX}{encoded}.m3u8"
 
                 lines.append(extinf)
                 lines.extend(VLC_HEADERS)
                 lines.append(proxy)
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
-        fp.write("\n".join(lines) + "\n")
+    Path(OUTPUT_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    logging.info("Playlist written to %s (%d events)", OUTPUT_FILE, (len(lines) - 1) // 5)
 
-    logging.info("Playlist written to %s (%d English entries)",
-                 OUTPUT_FILE, (len(lines) - 1) // 5)
 
-# ───── main ───────────────────────────────────────────────────────────
+# ─── main ───────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(
-        description="Build English-only live-events playlist with logos")
-    ap.add_argument("-v", "--verbose", action="store_true",
-                    help="verbose (DEBUG) output")
+    ap = argparse.ArgumentParser(description="Build live-events playlist with logos")
+    ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s │ %(message)s")
+        format="%(levelname)s │ %(message)s",
+    )
 
-    schedule   = get_schedule()
-    chan_ids   = extract_channel_ids(schedule)
+    schedule = get_schedule()
+    chan_ids = extract_channel_ids(schedule)
     stream_map = build_stream_map(chan_ids)
-    make_playlist(schedule, stream_map)
+
+    with requests.Session() as s:
+        logo_index = build_logo_index(s)
+        make_playlist(schedule, stream_map, logo_index)
+
 
 if __name__ == "__main__":
     main()
