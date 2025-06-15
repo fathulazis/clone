@@ -1,29 +1,25 @@
 #!/usr/bin/env python3
 """
-events.py – build a live-events playlist from DaddyLive’s schedule feed
-----------------------------------------------------------------------
-• Fetch the schedule (needs Referer header → 200 OK)
-• Extract every channel_id even when “channels” / “channels2” are
-  lists, dicts, or single strings
-• Generate 5 candidate URLs per id, validate them concurrently
-• Base-64-encode the first working URL, prepend ddproxy prefix
-• Emit one 4-line M3U block per event to schedule_playlist.m3u8
-• -v / --verbose shows per-URL checks
+events.py  –  build live-events playlist with automatic TV-logos
 """
 
-import argparse
-import base64
-import logging
-import time
+import argparse, base64, logging, re, time, unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-# ───────────────────────── constants ─────────────────────────
+# ─── constants ─────────────────────────────────────────────────────────
 SCHEDULE_URL = "https://daddylive.dad/schedule/schedule-generated.php"
 PROXY_PREFIX = "https://josh9456-ddproxy.hf.space/watch/"
-OUTPUT_FILE = "schedule_playlist.m3u8"
+OUTPUT_FILE  = "schedule_playlist.m3u8"
+
+LOGO_REPO_API = (
+    "https://api.github.com/repos/IPTVtuner/TV-Logos/contents"
+)  # flat dir[3]
+LOGO_RAW_ROOT = (
+    "https://raw.githubusercontent.com/IPTVtuner/TV-Logos/master/"
+)
 
 URL_TEMPLATES = [
     "https://nfsnew.newkso.ru/nfs/premium{num}/mono.m3u8",
@@ -34,13 +30,11 @@ URL_TEMPLATES = [
 ]
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    # DaddyLive returns 403 without this referer
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/137.0.0.0 Safari/537.36",
     "Referer": "https://daddylive.dad/24-7-channels.php",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
 }
 
 VLC_HEADERS = [
@@ -52,7 +46,22 @@ VLC_HEADERS = [
     "Mobile/15E148 Safari/604.1",
 ]
 
-# ─────────────────────── fetch schedule ───────────────────────
+# ─── helpers ───────────────────────────────────────────────────────────
+def slugify(txt):
+    """Convert channel name to filename-style slug used by the logo repo."""
+    txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode()
+    txt = re.sub(r"[^\w\s-]", "", txt.lower())
+    txt = re.sub(r"\s+", "", txt)
+    return txt + ".png"
+
+def fetch_logo_index():
+    logging.info("Fetching logo index from GitHub …")
+    r = requests.get(LOGO_REPO_API, timeout=15)
+    r.raise_for_status()
+    index = {item["name"]: item["name"] for item in r.json() if item["type"] == "file"}
+    logging.info("✓ %d logo files listed", len(index))
+    return index
+
 def get_schedule():
     logging.info("Fetching schedule JSON …")
     r = requests.get(SCHEDULE_URL, headers=HEADERS, timeout=15)
@@ -60,53 +69,37 @@ def get_schedule():
     logging.info("✓ schedule obtained (%d bytes)", len(r.content))
     return r.json()
 
-# ─────────────────────── helpers ──────────────────────────────
 def _extract_cid(item):
-    """Accept dicts with channel_id or bare strings/ints."""
     if isinstance(item, dict):
         return str(item.get("channel_id"))
-    if item is not None:
-        return str(item)
-    return None
+    return str(item)
 
 def _channel_entries(event):
-    """
-    Yield every channel entry from 'channels' / 'channels2' irrespective
-    of whether the field is a list, dict, or single object.
-    """
     for key in ("channels", "channels2"):
         val = event.get(key)
         if not val:
             continue
         if isinstance(val, list):
-            for ch in val:
-                yield ch
+            yield from val
         elif isinstance(val, dict):
-            # Either a mapping of index → object or single object
-            if "channel_id" in val or "channel_name" in val:
+            if "channel_id" in val:
                 yield val
             else:
-                for ch in val.values():
-                    yield ch
+                yield from val.values()
         else:
             yield val
 
 def extract_channel_ids(schedule):
     ids = set()
-    for _day, cats in schedule.items():
-        for _cat, events in cats.items():
+    for cats in schedule.values():
+        for events in cats.values():
             for ev in events:
-                for ch in _channel_entries(ev):
-                    if cid := _extract_cid(ch):
-                        ids.add(cid)
-    logging.info("Found %d unique channel IDs", len(ids))
+                ids.update(_extract_cid(ch) for ch in _channel_entries(ev))
     return ids
 
-# ────────────────────── validation ────────────────────────────
 def validate_single(url):
-    for attempt in range(1, 4):
+    for _ in range(3):
         try:
-            logging.debug("HEAD %s (try %d)", url, attempt)
             r = requests.head(url, headers=HEADERS, timeout=10, allow_redirects=True)
             if r.status_code == 200:
                 return url
@@ -115,95 +108,85 @@ def validate_single(url):
             if r.status_code == 429:
                 time.sleep(5)
                 continue
-            # fallback GET
             r = requests.get(url, headers=HEADERS, timeout=10, stream=True)
             if r.status_code == 200:
                 return url
             if r.status_code == 404:
                 return None
-        except requests.RequestException as e:
-            logging.debug("Request error %s: %s", url, e)
+        except requests.RequestException:
             return None
     return None
 
 def build_stream_map(channel_ids, workers=20):
-    logging.info("Validating candidate URLs …")
     candidates = {tpl.format(num=i): i for i in channel_ids for tpl in URL_TEMPLATES}
     id_to_url = {}
-
     with ThreadPoolExecutor(workers) as pool:
         futures = {pool.submit(validate_single, u): u for u in candidates}
-        for fut in as_completed(futures):
-            res = fut.result()
+        for f in as_completed(futures):
+            res = f.result()
             if res:
                 cid = candidates[res]
-                if cid not in id_to_url:
-                    id_to_url[cid] = res
-                    logging.info("✓ %s", res)
-
-    logging.info("Obtained %d working streams", len(id_to_url))
+                id_to_url.setdefault(cid, res)  # first hit wins
+    logging.info("✓ %d working streams", len(id_to_url))
     return id_to_url
 
-# ─────────────────────── playlist build ───────────────────────
-def make_playlist(schedule, stream_map):
+# ─── playlist assembly ────────────────────────────────────────────────
+def make_playlist(schedule, stream_map, logo_index):
     logging.info("Assembling playlist …")
     lines = ["#EXTM3U"]
     grouped = defaultdict(list)
-
     for day, cats in schedule.items():
         for cat, events in cats.items():
             for ev in events:
-                grouped[cat.upper()].append((day, ev))
+                grouped[cat.upper()].append(ev)
 
     for group in sorted(grouped):
-        for day, ev in grouped[group]:
+        for ev in grouped[group]:
             title = ev["event"]
             for ch in _channel_entries(ev):
-                cid = _extract_cid(ch)
-                if not cid:
-                    continue
+                cid   = _extract_cid(ch)
+                cname = ch["channel_name"] if isinstance(ch, dict) else "Unknown"
                 stream = stream_map.get(cid)
                 if not stream:
-                    logging.debug("No stream for channel %s", cid)
                     continue
 
-                cname = ch.get("channel_name") if isinstance(ch, dict) else "Unknown"
-                encoded = base64.b64encode(stream.encode()).decode()
-                proxy_url = f"{PROXY_PREFIX}{encoded}.m3u8"
+                # logo lookup
+                slug = slugify(cname)
+                logo_url = LOGO_RAW_ROOT + slug if slug in logo_index else ""
 
-                extinf = (
-                    f'#EXTINF:-1 tvg-id="{cid}" '
-                    f'tvg-logo="https://raw.githubusercontent.com/'
-                    f'pigzillaaaaa/iptv-scraper/main/imgs/tv-logo.png" '
-                    f'group-title="{group}",{title} ({cname})'
-                )
+                extinf = f'#EXTINF:-1 tvg-id="{cid}" '
+                if logo_url:
+                    extinf += f'tvg-logo="{logo_url}" '
+                extinf += f'group-title="{group}",{title} ({cname})'
+
+                encoded = base64.b64encode(stream.encode()).decode()
+                proxy   = f"{PROXY_PREFIX}{encoded}.m3u8"
 
                 lines.append(extinf)
                 lines.extend(VLC_HEADERS)
-                lines.append(proxy_url)
+                lines.append(proxy)
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
         fp.write("\n".join(lines) + "\n")
-
     logging.info("Playlist written to %s (%d entries)",
                  OUTPUT_FILE, (len(lines) - 1) // 5)
 
-# ───────────────────────── main ───────────────────────────────
+# ─── main ────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
-        description="Build live-events playlist from DaddyLive schedule")
+        description="Build live-events playlist with auto-logos")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="verbose (DEBUG) output")
     args = ap.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s │ %(message)s")
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s │ %(message)s")
 
-    schedule = get_schedule()
-    chan_ids = extract_channel_ids(schedule)
+    schedule   = get_schedule()
+    chan_ids   = extract_channel_ids(schedule)
     stream_map = build_stream_map(chan_ids)
-    make_playlist(schedule, stream_map)
+    logo_index = fetch_logo_index()
+    make_playlist(schedule, stream_map, logo_index)
 
 if __name__ == "__main__":
     main()
