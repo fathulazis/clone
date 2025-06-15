@@ -1,4 +1,5 @@
 #EXTM3U
+#EXTM3U url-tvg="https://bit.ly/a1xepg"
 #EXTINF:-1 tvg-id="15" tvg-logo="https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/no-logo.png" group-title="AM. FOOTBALL",European League of Football : Berlin Thunder vs Fehervar Enthroners (ProSieben MAXX DE)
 #EXTVLCOPT:http-origin=https://lefttoplay.xyz
 #EXTVLCOPT:http-referrer=https://lefttoplay.xyz/
