@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-events.py – build live-events playlist with tv-logo repo artwork
+events.py – build live-events playlist with tv-logo repo artwork and EPG matching
 """
 
 import argparse
@@ -9,6 +9,7 @@ import logging
 import re
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -18,6 +19,7 @@ import requests
 SCHEDULE_URL = "https://daddylive.dad/schedule/schedule-generated.php"
 PROXY_PREFIX = "https://josh9456-ddproxy.hf.space/watch/"
 OUTPUT_FILE  = "schedule_playlist.m3u8"
+EPG_URL = "https://bit.ly/a1xepg"
 
 TVLOGO_RAW_ROOT = "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/"
 TVLOGO_API_ROOT = "https://api.github.com/repos/tv-logo/tv-logos/contents/countries"
@@ -57,51 +59,130 @@ def slugify(channel: str) -> str:
     txt = re.sub(r"\s+", "-", txt).strip("-")
     return txt
 
+def normalize_channel_name(name: str) -> str:
+    """Normalize channel name for EPG matching."""
+    name = name.upper().strip()
+    # Remove common suffixes that might interfere with matching
+    suffixes = [" HD", " SD", " US", " UK", " CA", " AU", " DE", " FR", " ES", " IT"]
+    for suffix in suffixes:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    return re.sub(r'[^\w\s]', '', name).strip()
+
+def download_and_parse_epg(session: requests.Session) -> dict:
+    """Download and parse EPG XML to build channel mapping."""
+    logging.info("Downloading EPG from %s...", EPG_URL)
+    
+    try:
+        r = session.get(EPG_URL, timeout=60)
+        r.raise_for_status()
+        
+        # Parse XML
+        root = ET.fromstring(r.content)
+        epg_channels = {}
+        
+        # Extract channel information from XMLTV format
+        for channel in root.findall('.//channel'):
+            channel_id = channel.get('id', '')
+            display_names = [dn.text for dn in channel.findall('display-name') if dn.text]
+            
+            if channel_id and display_names:
+                # Store all possible display names for this channel ID
+                for name in display_names:
+                    normalized = normalize_channel_name(name)
+                    epg_channels[normalized] = channel_id
+                    # Also store the original name
+                    epg_channels[name.upper().strip()] = channel_id
+        
+        logging.info("✓ EPG parsed with %d channel mappings", len(epg_channels))
+        return epg_channels
+        
+    except Exception as e:
+        logging.warning("Failed to download/parse EPG: %s", e)
+        return {}
+
+def find_epg_id(channel_name: str, epg_channels: dict) -> str:
+    """Find the best matching EPG channel ID for a given channel name."""
+    if not epg_channels:
+        return ""
+    
+    normalized = normalize_channel_name(channel_name)
+    
+    # Direct match
+    if normalized in epg_channels:
+        return epg_channels[normalized]
+    
+    # Try original name
+    if channel_name.upper().strip() in epg_channels:
+        return epg_channels[channel_name.upper().strip()]
+    
+    # Fuzzy matching - find partial matches
+    for epg_name, epg_id in epg_channels.items():
+        if normalized in epg_name or epg_name in normalized:
+            return epg_id
+    
+    # Try just the first word
+    first_word = normalized.split()[0] if normalized.split() else ""
+    if first_word:
+        for epg_name, epg_id in epg_channels.items():
+            if first_word in epg_name:
+                return epg_id
+    
+    return ""
+
 def build_comprehensive_logo_index(session: requests.Session) -> dict:
     """Build complete logo index from tv-logo repo."""
     logging.info("Building comprehensive logo index from tv-logo repo...")
     logo_index = {}
     
-    # Get all country directories
-    r = session.get(TVLOGO_API_ROOT, timeout=30)
-    r.raise_for_status()
-    countries = [item["name"] for item in r.json() if item["type"] == "dir"]
-    
-    logging.info("Found %d countries in logo repo", len(countries))
-    
-    # For each country, get all logo files
-    for country in countries:
-        try:
-            country_url = f"{TVLOGO_API_ROOT}/{country}"
-            r = session.get(country_url, timeout=30)
-            r.raise_for_status()
-            
-            for file_info in r.json():
-                if file_info["type"] == "file" and file_info["name"].endswith(".png"):
-                    filename = file_info["name"]
-                    full_url = f"{TVLOGO_RAW_ROOT}{country}/{filename}"
-                    
-                    # Store multiple variations for flexible matching
-                    base_name = filename.replace(".png", "")
-                    logo_index[filename] = full_url
-                    logo_index[base_name] = full_url
-                    
-                    # Also store without country suffix for broader matching
-                    for suffix in ["-us", "-uk", "-ca", "-au", "-de", "-fr", "-es", "-it"]:
-                        if base_name.endswith(suffix):
-                            clean_name = base_name.replace(suffix, "")
-                            logo_index[clean_name] = full_url
-                            logo_index[clean_name + ".png"] = full_url
-                    
-        except Exception as e:
-            logging.debug("Failed to fetch logos for %s: %s", country, e)
-            continue
-    
-    logging.info("✓ Logo index built with %d entries", len(logo_index))
-    return logo_index
+    try:
+        # Get all country directories
+        r = session.get(TVLOGO_API_ROOT, timeout=30)
+        r.raise_for_status()
+        countries = [item["name"] for item in r.json() if item["type"] == "dir"]
+        
+        logging.info("Found %d countries in logo repo", len(countries))
+        
+        # For each country, get all logo files
+        for country in countries:
+            try:
+                country_url = f"{TVLOGO_API_ROOT}/{country}"
+                r = session.get(country_url, timeout=30)
+                r.raise_for_status()
+                
+                for file_info in r.json():
+                    if file_info["type"] == "file" and file_info["name"].endswith(".png"):
+                        filename = file_info["name"]
+                        full_url = f"{TVLOGO_RAW_ROOT}{country}/{filename}"
+                        
+                        # Store multiple variations for flexible matching
+                        base_name = filename.replace(".png", "")
+                        logo_index[filename] = full_url
+                        logo_index[base_name] = full_url
+                        
+                        # Also store without country suffix for broader matching
+                        for suffix in ["-us", "-uk", "-ca", "-au", "-de", "-fr", "-es", "-it"]:
+                            if base_name.endswith(suffix):
+                                clean_name = base_name.replace(suffix, "")
+                                logo_index[clean_name] = full_url
+                                logo_index[clean_name + ".png"] = full_url
+                        
+            except Exception as e:
+                logging.debug("Failed to fetch logos for %s: %s", country, e)
+                continue
+        
+        logging.info("✓ Logo index built with %d entries", len(logo_index))
+        return logo_index
+        
+    except Exception as e:
+        logging.warning("Failed to build logo index: %s", e)
+        return {}
 
 def find_best_logo(channel_name: str, logo_index: dict) -> str:
     """Find the best matching logo for a channel name."""
+    if not logo_index:
+        return "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/no-logo.png"
+        
     slug = slugify(channel_name)
     
     # Try multiple variations
@@ -186,8 +267,12 @@ def build_stream_map(channel_ids, workers=20):
     logging.info("✓ %d working streams", len(id_to_url))
     return id_to_url
 
-def make_playlist(schedule, stream_map, logo_index):
+def make_playlist(schedule, stream_map, logo_index, epg_channels):
     lines = ["#EXTM3U"]
+    
+    # Add EPG URL to playlist header
+    lines.append(f"#EXTM3U url-tvg=\"{EPG_URL}\"")
+    
     grouped = defaultdict(list)
     for day, cats in schedule.items():
         for cat, events in cats.items():
@@ -203,9 +288,13 @@ def make_playlist(schedule, stream_map, logo_index):
                 if not stream:
                     continue
 
+                # Find EPG ID
+                epg_id = find_epg_id(cname, epg_channels)
+                tvg_id = epg_id if epg_id else cid
+                
                 logo_url = find_best_logo(cname, logo_index)
                 extinf = (
-                    f'#EXTINF:-1 tvg-id="{cid}" '
+                    f'#EXTINF:-1 tvg-id="{tvg_id}" '
                     f'tvg-logo="{logo_url}" '
                     f'group-title="{group}",{title} ({cname})'
                 )
@@ -219,10 +308,10 @@ def make_playlist(schedule, stream_map, logo_index):
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
         fp.write("\n".join(lines) + "\n")
-    logging.info("Playlist written to %s (%d events)", OUTPUT_FILE, (len(lines) - 1) // 5)
+    logging.info("Playlist written to %s (%d events)", OUTPUT_FILE, (len(lines) - 2) // 5)  # -2 for header lines
 
 def main():
-    ap = argparse.ArgumentParser(description="Build live-events playlist with comprehensive logos")
+    ap = argparse.ArgumentParser(description="Build live-events playlist with logos and EPG")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -237,7 +326,8 @@ def main():
 
     with requests.Session() as session:
         logo_index = build_comprehensive_logo_index(session)
-        make_playlist(schedule, stream_map, logo_index)
+        epg_channels = download_and_parse_epg(session)
+        make_playlist(schedule, stream_map, logo_index, epg_channels)
 
 if __name__ == "__main__":
     main()
