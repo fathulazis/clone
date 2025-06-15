@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 """
-events.py  –  build live-events playlist with automatic TV-logos
+events.py ─ build a DaddyLive “live events” playlist
+
+• pulls the JSON schedule
+• validates every candidate stream (same logic you already use)
+• keeps **only English-speaking feeds** (USA, UK, Canada, Australia,
+  New Zealand, Malaysia)
+• auto-adds a tvg-logo if a file with the channel slug exists in the
+  iptv-org/logo repo
+• writes one 4-line block per event to schedule_playlist.m3u8
+• ‑v / --verbose prints DEBUG detail
 """
 
-import argparse, base64, logging, re, time, unicodedata
+import argparse
+import base64
+import logging
+import re
+import time
+import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 
 import requests
 
-# ─── constants ─────────────────────────────────────────────────────────
-SCHEDULE_URL = "https://daddylive.dad/schedule/schedule-generated.php"
-PROXY_PREFIX = "https://josh9456-ddproxy.hf.space/watch/"
-OUTPUT_FILE  = "schedule_playlist.m3u8"
-
-LOGO_REPO_API = (
-    "https://api.github.com/repos/IPTVtuner/TV-Logos/contents"
-)  # flat dir[3]
-LOGO_RAW_ROOT = (
-    "https://raw.githubusercontent.com/IPTVtuner/TV-Logos/master/"
-)
+# ───── constants ──────────────────────────────────────────────────────
+SCHEDULE_URL  = "https://daddylive.dad/schedule/schedule-generated.php"
+PROXY_PREFIX  = "https://josh9456-ddproxy.hf.space/watch/"
+OUTPUT_FILE   = "schedule_playlist.m3u8"
 
 URL_TEMPLATES = [
     "https://nfsnew.newkso.ru/nfs/premium{num}/mono.m3u8",
@@ -46,21 +54,33 @@ VLC_HEADERS = [
     "Mobile/15E148 Safari/604.1",
 ]
 
-# ─── helpers ───────────────────────────────────────────────────────────
-def slugify(txt):
-    """Convert channel name to filename-style slug used by the logo repo."""
-    txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode()
-    txt = re.sub(r"[^\w\s-]", "", txt.lower())
-    txt = re.sub(r"\s+", "", txt)
-    return txt + ".png"
+# countries whose channels we want to keep
+ALLOWED_COUNTRY_KEYWORDS = {
+    "USA", "US", "UK", "EN", "ENG", "CAN", "CANADA",
+    "AU", "AUS", "AUSTRALIA", "NZ", "NEWZEALAND", "MYS", "MY", "MALAYSIA"
+}
 
-def fetch_logo_index():
-    logging.info("Fetching logo index from GitHub …")
-    r = requests.get(LOGO_REPO_API, timeout=15)
-    r.raise_for_status()
-    index = {item["name"]: item["name"] for item in r.json() if item["type"] == "file"}
-    logging.info("✓ %d logo files listed", len(index))
-    return index
+LOGO_RAW = "https://raw.githubusercontent.com/iptv-org/logos/master/tv/{slug}.png"
+
+# ───── helpers ────────────────────────────────────────────────────────
+def slugify(name: str) -> str:
+    text = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    text = re.sub(r"[^\w\s-]", "", text).lower()
+    text = re.sub(r"\s+", "-", text).strip("-")
+    return text
+
+def is_allowed_channel(name: str) -> bool:
+    upper = name.upper().replace(" ", "")
+    return any(k in upper for k in ALLOWED_COUNTRY_KEYWORDS)
+
+@lru_cache(maxsize=None)
+def logo_exists(slug: str, session: requests.Session) -> bool:
+    url = LOGO_RAW.format(slug=slug)
+    try:
+        r = session.head(url, timeout=10)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
 
 def get_schedule():
     logging.info("Fetching schedule JSON …")
@@ -74,14 +94,15 @@ def _extract_cid(item):
         return str(item.get("channel_id"))
     return str(item)
 
-def _channel_entries(event):
+def _channel_entries(ev):
     for key in ("channels", "channels2"):
-        val = event.get(key)
+        val = ev.get(key)
         if not val:
             continue
         if isinstance(val, list):
             yield from val
         elif isinstance(val, dict):
+            # mapping (idx → obj) or single object
             if "channel_id" in val:
                 yield val
             else:
@@ -94,7 +115,8 @@ def extract_channel_ids(schedule):
     for cats in schedule.values():
         for events in cats.values():
             for ev in events:
-                ids.update(_extract_cid(ch) for ch in _channel_entries(ev))
+                for ch in _channel_entries(ev):
+                    ids.add(_extract_cid(ch))
     return ids
 
 def validate_single(url):
@@ -108,6 +130,7 @@ def validate_single(url):
             if r.status_code == 429:
                 time.sleep(5)
                 continue
+            # fallback GET
             r = requests.get(url, headers=HEADERS, timeout=10, stream=True)
             if r.status_code == 200:
                 return url
@@ -118,41 +141,47 @@ def validate_single(url):
     return None
 
 def build_stream_map(channel_ids, workers=20):
+    logging.info("Validating %d×5 candidate URLs …", len(channel_ids))
     candidates = {tpl.format(num=i): i for i in channel_ids for tpl in URL_TEMPLATES}
     id_to_url = {}
     with ThreadPoolExecutor(workers) as pool:
         futures = {pool.submit(validate_single, u): u for u in candidates}
-        for f in as_completed(futures):
-            res = f.result()
+        for fut in as_completed(futures):
+            res = fut.result()
             if res:
                 cid = candidates[res]
-                id_to_url.setdefault(cid, res)  # first hit wins
+                id_to_url.setdefault(cid, res)
+                logging.debug("✓ %s", res)
     logging.info("✓ %d working streams", len(id_to_url))
     return id_to_url
 
-# ─── playlist assembly ────────────────────────────────────────────────
-def make_playlist(schedule, stream_map, logo_index):
-    logging.info("Assembling playlist …")
+# ───── playlist builder ───────────────────────────────────────────────
+def make_playlist(schedule, stream_map):
+    logging.info("Assembling playlist (English-speaking channels only)…")
     lines = ["#EXTM3U"]
     grouped = defaultdict(list)
+
     for day, cats in schedule.items():
         for cat, events in cats.items():
             for ev in events:
                 grouped[cat.upper()].append(ev)
 
+    session = requests.Session()
+
     for group in sorted(grouped):
         for ev in grouped[group]:
             title = ev["event"]
             for ch in _channel_entries(ev):
-                cid   = _extract_cid(ch)
-                cname = ch["channel_name"] if isinstance(ch, dict) else "Unknown"
+                cname = ch["channel_name"] if isinstance(ch, dict) else str(ch)
+                if not is_allowed_channel(cname):
+                    continue
+                cid    = _extract_cid(ch)
                 stream = stream_map.get(cid)
                 if not stream:
                     continue
 
-                # logo lookup
                 slug = slugify(cname)
-                logo_url = LOGO_RAW_ROOT + slug if slug in logo_index else ""
+                logo_url = LOGO_RAW.format(slug=slug) if logo_exists(slug, session) else ""
 
                 extinf = f'#EXTINF:-1 tvg-id="{cid}" '
                 if logo_url:
@@ -168,25 +197,26 @@ def make_playlist(schedule, stream_map, logo_index):
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
         fp.write("\n".join(lines) + "\n")
-    logging.info("Playlist written to %s (%d entries)",
+
+    logging.info("Playlist written to %s (%d English entries)",
                  OUTPUT_FILE, (len(lines) - 1) // 5)
 
-# ─── main ────────────────────────────────────────────────────────────
+# ───── main ───────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
-        description="Build live-events playlist with auto-logos")
+        description="Build English-only live-events playlist with logos")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="verbose (DEBUG) output")
     args = ap.parse_args()
 
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(levelname)s │ %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s │ %(message)s")
 
     schedule   = get_schedule()
     chan_ids   = extract_channel_ids(schedule)
     stream_map = build_stream_map(chan_ids)
-    logo_index = fetch_logo_index()
-    make_playlist(schedule, stream_map, logo_index)
+    make_playlist(schedule, stream_map)
 
 if __name__ == "__main__":
     main()
