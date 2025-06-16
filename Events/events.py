@@ -261,15 +261,18 @@ def get_schedule():
 def _extract_cid(item) -> str:
     return str(item["channel_id"]) if isinstance(item, dict) else str(item)
 
-def _channel_entries(ev: dict):
+def _channel_entries(event):
     for key in ("channels", "channels2"):
-        val = ev.get(key)
+        val = event.get(key)
         if not val:
             continue
         if isinstance(val, list):
             yield from val
         elif isinstance(val, dict):
-            yield val if "channel_id" in val else from dict(val).values()
+            if "channel_id" in val:
+                yield val
+            else:
+                yield from val.values()
         else:
             yield val
 
