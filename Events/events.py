@@ -369,7 +369,7 @@ def make_playlist(schedule, stream_map, logo_index, epg_channels):
                     f'group-title="{group}",{title} ({cname})'
                 )
 
-                encoded = base64.b64decode(stream.encode()).decode()
+                encoded = base64.b64encode(stream.encode()).decode() 
                 proxy = f"{PROXY_PREFIX}{encoded}.m3u8"
 
                 lines.append(extinf)
