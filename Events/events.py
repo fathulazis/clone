@@ -125,28 +125,39 @@ def _compress_long(slug: str) -> list[str]:
 
 # ── EPG lookup build ───────────────────────────────────────────────────────
 def build_epg_lookup(lines: list[str]) -> dict[str, list[str]]:
-    look = defaultdict(list)
+    """
+    For every EPG line create MANY aliases, so
+      TNT.Sports.4.HD.uk  →  tnt sports 4 hd, tnt sports 4, tnt sports …
+    All aliases also exist with the country suffix: “… uk”.
+    """
+    table: dict[str, list[str]] = defaultdict(list)
+
     for line in lines:
-        line = line.strip()
-        if not line or line.startswith('#'):
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
             continue
 
-        parts = line.split('.')
-        country = parts[-1] if len(parts[-1]) == 2 else None
-        brand   = '.'.join(parts[:-1]) if country else line
+        # split “… .uk”  or keep whole line if no country code
+        parts    = raw.split(".")
+        country  = parts[-1].lower() if len(parts[-1]) == 2 else None
+        brand    = parts[:-1] if country else parts           # every block except cc
+        brand_sp = " ".join(brand)                            # dotted → spaced words
+        brand_cl = re.sub(r"[^a-z0-9 ]", " ", brand_sp.lower())
+        brand_cl = re.sub(r"\s+", " ", brand_cl).strip()      # normalised
 
-        clean   = re.sub(r'[^0-9A-Za-z ]', ' ', brand)
-        clean   = re.sub(r'\s+', ' ', clean).strip().lower()
-        slug    = clean.replace(' ', '')
+        # progressive prefixes:  "tnt sports 4 hd" →  full, drop "hd", drop "4", …
+        words = brand_cl.split()
+        for i in range(len(words), 0, -1):
+            frag = " ".join(words[:i])
+            for key in (frag, frag.replace(" ", "")):         # spaced and slug form
+                table[key].append(raw)
+                if country:
+                    table[f"{key}.{country}"].append(raw)
 
-        keys = {line.lower(), clean, slug}
-        keys.update(_expand_abbr(slug))
-        if country:
-            keys.update({f"{k}.{country}" for k in keys})
+        # original full lower-cased line for safety
+        table[raw.lower()].append(raw)
 
-        for k in keys:
-            look[k].append(line)
-    return look
+    return table
 
 # ── brand variation generator ──────────────────────────────────────────────
 def generate_brand_variations(brand: str) -> list[str]:
