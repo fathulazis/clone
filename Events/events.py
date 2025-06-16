@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """
-events.py – better EPG matching for live events playlist
+events.py ─ Build a live–events playlist with
+            • validated streams
+            • logo matching
+            • robust EPG (tvg-id) matching        ⇐ fixed
+
+Drop the file in an empty directory, run
+
+    python3 events.py -v
+
+and the playlist will be written to  ▸ schedule_playlist.m3u8
 """
+from __future__ import annotations
 
 import argparse
 import base64
+import difflib          # ← NEW
 import logging
 import re
 import time
@@ -14,16 +25,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-# ─── constants ──────────────────────────────────────────────
-SCHEDULE_URL = "https://daddylive.dad/schedule/schedule-generated.php"
-PROXY_PREFIX = "https://josh9456-ddproxy.hf.space/watch/"
-OUTPUT_FILE  = "schedule_playlist.m3u8"
+# ───────────────────────────── constants ────────────────────────────────
+SCHEDULE_URL      = "https://daddylive.dad/schedule/schedule-generated.php"
+PROXY_PREFIX      = "https://josh9456-ddproxy.hf.space/watch/"
+OUTPUT_FILE       = "schedule_playlist.m3u8"
 
-EPG_IDS_URL = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.txt"
-EPG_XML_URL = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
+EPG_IDS_URL       = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.txt"
+EPG_XML_URL       = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
 
-TVLOGO_RAW_ROOT = "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/"
-TVLOGO_API_ROOT = "https://api.github.com/repos/tv-logo/tv-logos/contents/countries"
+TVLOGO_RAW_ROOT   = "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/"
+TVLOGO_API_ROOT   = "https://api.github.com/repos/tv-logo/tv-logos/contents/countries"
 
 URL_TEMPLATES = [
     "https://nfsnew.newkso.ru/nfs/premium{num}/mono.m3u8",
@@ -36,7 +47,7 @@ URL_TEMPLATES = [
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
     ),
     "Referer": "https://daddylive.dad/24-7-channels.php",
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -51,278 +62,260 @@ VLC_HEADERS = [
     "Mobile/15E148 Safari/604.1",
 ]
 
-# Enhanced country mapping for better EPG matching
+# ─────────────── enhanced country name → ISO-2 lookup ────────────────
 COUNTRY_CODES = {
     'usa': 'us', 'united states': 'us', 'america': 'us',
     'uk': 'uk', 'united kingdom': 'uk', 'britain': 'uk', 'england': 'uk',
     'canada': 'ca', 'can': 'ca',
     'australia': 'au', 'aus': 'au',
     'new zealand': 'nz', 'newzealand': 'nz',
-    'germany': 'de', 'deutschland': 'de', 'german': 'de',
-    'france': 'fr', 'french': 'fr',
-    'spain': 'es', 'spanish': 'es', 'españa': 'es',
-    'italy': 'it', 'italian': 'it', 'italia': 'it',
-    'croatia': 'hr', 'hrvatska': 'hr',
-    'serbia': 'rs', 'srbija': 'rs',
-    'netherlands': 'nl', 'holland': 'nl', 'dutch': 'nl',
-    'portugal': 'pt', 'portuguese': 'pt',
-    'poland': 'pl', 'polish': 'pl', 'polska': 'pl',
-    'greece': 'gr', 'greek': 'gr',
-    'bulgaria': 'bg', 'bulgarian': 'bg',
-    'israel': 'il', 'hebrew': 'il',
-    'malaysia': 'my', 'malay': 'my',
+    'germany': 'de', 'deutschland': 'de',
+    'france': 'fr',
+    'spain': 'es', 'españa': 'es',
+    'italy': 'it', 'italia': 'it',
+    'croatia': 'hr',
+    'serbia': 'rs',
+    'netherlands': 'nl', 'holland': 'nl',
+    'portugal': 'pt',
+    'poland': 'pl',
+    'greece': 'gr',
+    'bulgaria': 'bg',
+    'israel': 'il',
+    'malaysia': 'my',
 }
 
-# ─── helpers ────────────────────────────────────────────────
-def extract_channel_info(channel_name):
-    """Extract channel brand and country from full channel name."""
-    # Common patterns: "Channel Name Country" or "Channel Name (Country)"
+# ───────────────────────────── helpers ────────────────────────────────
+def extract_channel_info(channel_name: str) -> tuple[str, str]:
+    """
+    Split a channel string into (brand, country_code)
+    Recognises both “… (UK)” and “… UK” styles.
+    """
     name = channel_name.strip()
-    
-    # Handle parentheses format: "BBC Two (UK)" -> "BBC Two", "UK"
-    paren_match = re.search(r'^(.+?)\s*\(([^)]+)\)$', name)
-    if paren_match:
-        channel_brand = paren_match.group(1).strip()
-        country_part = paren_match.group(2).strip().lower()
-        country = COUNTRY_CODES.get(country_part, country_part[:2])
-        return channel_brand, country
-    
-    # Handle space-separated format: "BBC Two UK" -> "BBC Two", "UK"
-    words = name.split()
-    if len(words) >= 2:
-        # Check if last word(s) are countries
-        for i in range(len(words)-1, 0, -1):
-            potential_country = ' '.join(words[i:]).lower()
-            if potential_country in COUNTRY_CODES:
-                channel_brand = ' '.join(words[:i]).strip()
-                country = COUNTRY_CODES[potential_country]
-                return channel_brand, country
-    
-    # Fallback: try to detect country from common patterns
-    name_lower = name.lower()
-    for country_name, code in COUNTRY_CODES.items():
-        if country_name in name_lower:
-            channel_brand = re.sub(rf'\b{re.escape(country_name)}\b', '', name_lower, flags=re.IGNORECASE).strip()
-            return channel_brand.title(), code
-    
+
+    # “BBC Two (UK)”
+    m = re.search(r'^(.+?)\s*\(([^)]+)\)$', name)
+    if m:
+        return m.group(1).strip(), COUNTRY_CODES.get(m.group(2).lower(), 'unknown')
+
+    # “… UK”
+    parts = name.split()
+    for i in range(len(parts) - 1, 0, -1):
+        maybe_country = ' '.join(parts[i:]).lower()
+        if maybe_country in COUNTRY_CODES:
+            return ' '.join(parts[:i]).strip(), COUNTRY_CODES[maybe_country]
+
+    # keyword inside string
+    lower = name.lower()
+    for country, code in COUNTRY_CODES.items():
+        if country in lower:
+            brand = re.sub(rf'\b{re.escape(country)}\b', '', name, flags=re.I)
+            return brand.strip(), code
+
     return name, 'unknown'
 
-def build_epg_lookup(epg_text_lines):
-    """Build comprehensive EPG lookup with channel brand extraction."""
-    epg_lookup = defaultdict(list)
-    
-    for line in epg_text_lines:
+
+def build_epg_lookup(epg_lines: list[str]) -> dict[str, list[str]]:
+    """
+    Build a dictionary with MANY possible keys that can reference an EPG id.
+    Keys added for each line:
+      • whole line   (case-insensitive)
+      • cleaned brand
+      • brand slug without spaces
+      • brand.country (if country present)
+    """
+    epg = defaultdict(list)
+
+    for line in epg_lines:
         line = line.strip()
         if not line or line.startswith('#'):
             continue
-            
-        # Parse EPG ID format: usually "ChannelName.country" or similar
+
         parts = line.split('.')
-        if len(parts) >= 2:
-            # Extract potential channel name and country
-            potential_channel = parts[0]
-            potential_country = parts[-1] if len(parts[-1]) == 2 else None
-            
-            # Clean channel name
-            clean_channel = re.sub(r'[^a-zA-Z0-9\s]', ' ', potential_channel)
-            clean_channel = re.sub(r'\s+', ' ', clean_channel).strip()
-            
-            # Store multiple lookup keys
-            epg_lookup[clean_channel.lower()].append(line)
-            epg_lookup[line.lower()].append(line)
-            
-            # If we have a country, also store country-specific lookups
-            if potential_country:
-                key = f"{clean_channel.lower()}.{potential_country}"
-                epg_lookup[key].append(line)
+        if len(parts) >= 2 and len(parts[-1]) == 2:
+            country = parts[-1]
+            brand   = '.'.join(parts[:-1])
         else:
-            # Handle simple format
-            clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', line)
-            clean = re.sub(r'\s+', ' ', clean).strip()
-            epg_lookup[clean.lower()].append(line)
-            epg_lookup[line.lower()].append(line)
-    
-    return epg_lookup
+            country = None
+            brand   = line
 
-def find_best_epg_match(channel_name, epg_lookup):
-    """Find best EPG match using intelligent channel brand + country matching."""
-    channel_brand, country = extract_channel_info(channel_name)
-    
-    # Priority order for matching
-    search_terms = []
-    
-    # 1. Exact brand + country match
-    if country != 'unknown':
-        search_terms.append(f"{channel_brand.lower()}.{country}")
-        search_terms.append(f"{channel_brand.lower()}.{country}.hd")
-    
-    # 2. Brand variations
-    brand_clean = re.sub(r'\s+', '', channel_brand.lower())
-    search_terms.append(brand_clean)
-    search_terms.append(channel_brand.lower())
-    
-    # 3. Handle common network name variations
-    brand_variations = generate_brand_variations(channel_brand)
-    for variation in brand_variations:
-        if country != 'unknown':
-            search_terms.append(f"{variation}.{country}")
-        search_terms.append(variation)
-    
-    # Try each search term
-    for term in search_terms:
-        if term in epg_lookup:
-            matches = epg_lookup[term]
-            # Prefer matches with correct country
-            if country != 'unknown':
-                country_matches = [m for m in matches if f".{country}" in m.lower()]
-                if country_matches:
-                    logging.debug(f"EPG match for {channel_name}: {country_matches[0]}")
-                    return country_matches[0]
-            
-            # Return first match if no country preference
-            logging.debug(f"EPG match for {channel_name}: {matches[0]}")
-            return matches[0]
-    
-    # Fallback: fuzzy matching
-    for epg_id, _ in epg_lookup.items():
-        if brand_clean in epg_id or epg_id in brand_clean:
-            return epg_lookup[epg_id][0]
-    
-    return ""
+        # human clean
+        clean_brand = re.sub(r'[^A-Za-z0-9 ]', ' ', brand)
+        clean_brand = re.sub(r'\s+', ' ', clean_brand).strip().lower()
+        slug        = clean_brand.replace(' ', '')
 
-def generate_brand_variations(brand):
-    """Generate common variations of channel brand names."""
-    variations = set()
-    brand_lower = brand.lower()
-    
-    # Remove common words
-    clean_brand = re.sub(r'\b(tv|hd|sd|channel|network|sports?|news)\b', '', brand_lower).strip()
-    if clean_brand:
-        variations.add(clean_brand)
-    
-    # Handle abbreviations: "BBC Two" -> "bbc2", "BBC 2"
-    if 'two' in brand_lower:
-        variations.add(brand_lower.replace('two', '2'))
-        variations.add(brand_lower.replace(' two', '2'))
-    elif 'three' in brand_lower:
-        variations.add(brand_lower.replace('three', '3'))
-        variations.add(brand_lower.replace(' three', '3'))
-    
-    # Handle "Sports" variations
-    if 'sports' in brand_lower:
-        variations.add(brand_lower.replace('sports', 'sport'))
-    elif 'sport' in brand_lower:
-        variations.add(brand_lower.replace('sport', 'sports'))
-    
-    # Handle network abbreviations
-    network_abbrevs = {
+        for key in {line.lower(), clean_brand, slug}:
+            epg[key].append(line)
+
+        if country:
+            epg[f"{clean_brand}.{country}"].append(line)
+            epg[f"{slug}.{country}"].append(line)
+
+    return epg
+
+
+def generate_brand_variations(brand: str) -> list[str]:
+    """
+    A handful of quick substitutions that cover most sports-network quirks.
+    """
+    out: set[str] = set()
+    b = brand.lower()
+
+    # drop filler words
+    cleaned = re.sub(r'\b(tv|hd|sd|channel|network|sports?|news)\b', '', b).strip()
+    if cleaned:
+        out.add(cleaned)
+
+    # written numbers → digits
+    num_map = {'one':'1', 'two':'2', 'three':'3', 'four':'4'}
+    for word, digit in num_map.items():
+        if word in b:
+            out.add(b.replace(word, digit))
+
+    # sport(s) singular/plural
+    if 'sports' in b:
+        out.add(b.replace('sports', 'sport'))
+    if 'sport' in b and 'sports' not in b:
+        out.add(b.replace('sport', 'sports'))
+
+    # network abbreviations
+    net_abbr = {
         'espn': 'espn',
         'fox sports': 'foxsports',
         'sky sports': 'skysports',
         'tnt sports': 'tntsports',
         'bein sports': 'beinsports',
     }
-    
-    for full_name, abbrev in network_abbrevs.items():
-        if full_name in brand_lower:
-            variations.add(brand_lower.replace(full_name, abbrev))
-    
-    return list(variations)
+    for full, short in net_abbr.items():
+        if full in b:
+            out.add(b.replace(full, short))
 
-def download_epg_ids_from_txt(session: requests.Session):
-    """Download and parse EPG IDs with improved matching."""
-    logging.info("Downloading EPG IDs from text file...")
-    
+    # remove spaces altogether
+    out.add(b.replace(' ', ''))
+
+    return list(out)
+
+
+def find_best_epg_match(channel_name: str, epg_lookup: dict[str, list[str]]) -> str:
+    """
+    1. Exact “brand.country” then “brand”
+    2. Variations
+    3. Fuzzy similarity ≥ 0.60 (skip keys < 4 chars to avoid ‘a’, ‘tv’, …)
+    Returns the FIRST matching EPG id or "".
+    """
+    brand, country = extract_channel_info(channel_name)
+    brand_lc       = brand.lower()
+    slug           = brand_lc.replace(' ', '')
+
+    search_keys: list[str] = []
+
+    if country != 'unknown':
+        search_keys.extend([f"{brand_lc}.{country}", f"{slug}.{country}", f"{brand_lc}.{country}.hd"])
+
+    search_keys.extend([brand_lc, slug])
+    for v in generate_brand_variations(brand):
+        search_keys.append(v)
+        if country != 'unknown':
+            search_keys.append(f"{v}.{country}")
+
+    for key in search_keys:
+        if key in epg_lookup:
+            hits = epg_lookup[key]
+            # pick the hit whose tail matches the country if possible
+            if country != 'unknown':
+                by_country = [h for h in hits if h.lower().endswith(f".{country}")]
+                if by_country:
+                    return by_country[0]
+            return hits[0]
+
+    # ─── fuzzy rescue ─────────────────────────────────────────────
+    candidates = [k for k in epg_lookup if len(k) >= 4]
+    best       = difflib.get_close_matches(slug, candidates, n=1, cutoff=0.60)
+    if best:
+        return epg_lookup[best[0]][0]
+
+    return ""
+
+
+def download_epg_ids(session: requests.Session) -> dict[str, list[str]]:
+    logging.info("Downloading EPG id list …")
     try:
         r = session.get(EPG_IDS_URL, timeout=30)
         r.raise_for_status()
-        
-        logging.info("✓ EPG IDs downloaded (%d bytes)", len(r.content))
-        lines = r.text.splitlines()
-        epg_lookup = build_epg_lookup(lines)
-        
-        logging.info("✓ EPG lookup built with %d unique keys", len(epg_lookup))
-        return epg_lookup
-        
     except Exception as e:
-        logging.warning("Failed to download EPG IDs: %s", e)
+        logging.warning("EPG download failed: %s", e)
         return {}
 
-# [Rest of the functions remain the same: slugify, build_comprehensive_logo_index, 
-#  find_best_logo, get_schedule, _extract_cid, _channel_entries, extract_channel_ids,
-#  validate_single, build_stream_map]
+    epg_lookup = build_epg_lookup(r.text.splitlines())
+    logging.info("✓ %d unique EPG lookup keys", len(epg_lookup))
+    return epg_lookup
 
-def slugify(channel: str) -> str:
-    txt = unicodedata.normalize("NFKD", channel).encode("ascii", "ignore").decode().lower()
+
+# ╭──────────────────────────── logos ─────────────────────────────╮
+def slugify(text: str) -> str:
+    txt = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
     txt = txt.replace("&", "-and-").replace("+", "-plus-")
     txt = re.sub(r"[^\w\s-]", "", txt)
-    txt = re.sub(r"\s+", "-", txt).strip("-")
-    return txt
+    return re.sub(r"\s+", "-", txt).strip("-")
 
-def build_comprehensive_logo_index(session: requests.Session) -> dict:
-    logging.info("Building comprehensive logo index from tv-logo repo...")
-    logo_index = {}
-    
+
+def build_logo_index(session: requests.Session) -> dict[str, str]:
+    logging.info("Building logo index …")
+    index: dict[str, str] = {}
     try:
         r = session.get(TVLOGO_API_ROOT, timeout=30)
         r.raise_for_status()
-        countries = [item["name"] for item in r.json() if item["type"] == "dir"]
-        
+        countries = [it["name"] for it in r.json() if it["type"] == "dir"]
+
         for country in countries:
             try:
-                country_url = f"{TVLOGO_API_ROOT}/{country}"
-                r = session.get(country_url, timeout=30)
-                r.raise_for_status()
-                
-                for file_info in r.json():
-                    if file_info["type"] == "file" and file_info["name"].endswith(".png"):
-                        filename = file_info["name"]
-                        full_url = f"{TVLOGO_RAW_ROOT}{country}/{filename}"
-                        
-                        base_name = filename.replace(".png", "")
-                        logo_index[filename] = full_url
-                        logo_index[base_name] = full_url
-                        
-                        for suffix in ["-us", "-uk", "-ca", "-au", "-de", "-fr", "-es", "-it"]:
-                            if base_name.endswith(suffix):
-                                clean_name = base_name.replace(suffix, "")
-                                logo_index[clean_name] = full_url
-                        
-            except Exception as e:
-                logging.debug("Failed to fetch logos for %s: %s", country, e)
+                files = session.get(f"{TVLOGO_API_ROOT}/{country}", timeout=30).json()
+                for entry in files:
+                    if entry["type"] != "file" or not entry["name"].endswith(".png"):
+                        continue
+                    name     = entry["name"]
+                    base     = name[:-4]
+                    url      = f"{TVLOGO_RAW_ROOT}{country}/{name}"
+                    index[name]  = url
+                    index[base]  = url
+                    # strip country suffixes for generic matching
+                    for suf in ("-us", "-uk", "-ca", "-au", "-de", "-fr", "-es", "-it"):
+                        if base.endswith(suf):
+                            index[base[:-len(suf)]] = url
+            except Exception:
                 continue
-        
-        logging.info("✓ Logo index built with %d entries", len(logo_index))
-        return logo_index
-        
     except Exception as e:
-        logging.warning("Failed to build logo index: %s", e)
-        return {}
+        logging.warning("Logo index build failed: %s", e)
 
-def find_best_logo(channel_name: str, logo_index: dict) -> str:
-    if not logo_index:
-        return "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/no-logo.png"
-        
-    slug = slugify(channel_name)
-    variations = [slug, slug + ".png", slug.replace("-hd", ""), slug.replace("-sd", "")]
-    
-    for variant in variations:
-        if variant in logo_index:
-            return logo_index[variant]
-    
-    return "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/no-logo.png"
+    logging.info("✓ %d logo variants", len(index))
+    return index
 
-def get_schedule():
+
+def find_best_logo(channel: str, logos: dict[str, str]) -> str:
+    if not logos:
+        return f"{TVLOGO_RAW_ROOT}misc/no-logo.png"
+
+    slug = slugify(channel)
+    for key in (slug, slug.replace("-hd", ""), slug.replace("-sd", ""), slug + ".png"):
+        if key in logos:
+            return logos[key]
+
+    return f"{TVLOGO_RAW_ROOT}misc/no-logo.png"
+
+
+# ╭────────────────────────── schedule utils ─────────────────────╮
+def get_schedule() -> dict:
     r = requests.get(SCHEDULE_URL, headers=HEADERS, timeout=15)
     r.raise_for_status()
     return r.json()
 
-def _extract_cid(item):
+
+def _extract_cid(item) -> str:
     return str(item["channel_id"]) if isinstance(item, dict) else str(item)
 
-def _channel_entries(event):
+
+def _channel_entries(ev: dict):
     for key in ("channels", "channels2"):
-        val = event.get(key)
+        val = ev.get(key)
         if not val:
             continue
         if isinstance(val, list):
@@ -335,7 +328,8 @@ def _channel_entries(event):
         else:
             yield val
 
-def extract_channel_ids(schedule):
+
+def extract_channel_ids(schedule: dict) -> set[str]:
     ids = set()
     for cats in schedule.values():
         for events in cats.values():
@@ -343,94 +337,102 @@ def extract_channel_ids(schedule):
                 ids.update(_extract_cid(ch) for ch in _channel_entries(ev))
     return ids
 
-def validate_single(url):
+
+# ╭───────────────────────────── streams ─────────────────────────╮
+def validate_single(url: str) -> str | None:
     for _ in range(3):
         try:
             r = requests.head(url, headers=HEADERS, timeout=10, allow_redirects=True)
             if r.status_code == 200:
                 return url
-            if r.status_code == 404:
+            if r.status_code in (404, 410):
                 return None
             if r.status_code == 429:
                 time.sleep(5)
                 continue
+            # fall back to GET
             r = requests.get(url, headers=HEADERS, timeout=10, stream=True)
             if r.status_code == 200:
                 return url
-            if r.status_code == 404:
+            if r.status_code in (404, 410):
                 return None
         except requests.RequestException:
             return None
     return None
 
-def build_stream_map(channel_ids, workers=20):
-    candidates = {tpl.format(num=i): i for i in channel_ids for tpl in URL_TEMPLATES}
-    id_to_url = {}
+
+def build_stream_map(channel_ids: set[str], workers: int = 30) -> dict[str, str]:
+    cand = {tpl.format(num=i): i for i in channel_ids for tpl in URL_TEMPLATES}
+    id2url: dict[str, str] = {}
     with ThreadPoolExecutor(workers) as pool:
-        futures = {pool.submit(validate_single, u): u for u in candidates}
-        for fut in as_completed(futures):
+        futs = {pool.submit(validate_single, u): u for u in cand}
+        for fut in as_completed(futs):
             res = fut.result()
             if res:
-                id_to_url.setdefault(candidates[res], res)
-    logging.info("✓ %d working streams", len(id_to_url))
-    return id_to_url
+                id2url.setdefault(str(cand[res]), res)
+    logging.info("✓ %d working streams", len(id2url))
+    return id2url
 
-def make_playlist(schedule, stream_map, logo_index, epg_lookup):
-    lines = ["#EXTM3U"]
-    lines.append(f"#EXTM3U url-tvg=\"{EPG_XML_URL}\"")
-    
+
+# ╭────────────────────────── playlist build ─────────────────────╮
+def make_playlist(schedule: dict,
+                  stream_map: dict[str, str],
+                  logos: dict[str, str],
+                  epg_lookup: dict[str, list[str]]) -> None:
+
+    lines: list[str] = [
+        "#EXTM3U",
+        f'#EXTM3U url-tvg="{EPG_XML_URL}"'
+    ]
+
     grouped = defaultdict(list)
     for day, cats in schedule.items():
         for cat, events in cats.items():
             grouped[cat.upper()].extend(events)
 
-    epg_matches = 0
-    total_entries = 0
+    epg_hits = 0
+    total    = 0
 
     for group in sorted(grouped):
         for ev in grouped[group]:
             title = ev["event"]
             for ch in _channel_entries(ev):
                 cname = ch["channel_name"] if isinstance(ch, dict) else str(ch)
-                cid = _extract_cid(ch)
+                cid   = _extract_cid(ch)
                 stream = stream_map.get(cid)
                 if not stream:
                     continue
 
-                total_entries += 1
-                
-                # Use improved EPG matching
+                total += 1
                 epg_id = find_best_epg_match(cname, epg_lookup)
                 if epg_id:
-                    epg_matches += 1
+                    epg_hits += 1
                     tvg_id = epg_id
                 else:
-                    tvg_id = cid
-                
-                logo_url = find_best_logo(cname, logo_index)
-                extinf = (
-                    f'#EXTINF:-1 tvg-id="{tvg_id}" '
-                    f'tvg-logo="{logo_url}" '
+                    tvg_id = cid  # fallback: raw channel id
+
+                logo_url = find_best_logo(cname, logos)
+
+                lines.append(
+                    f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-logo="{logo_url}" '
                     f'group-title="{group}",{title} ({cname})'
                 )
-
-                encoded = base64.b64encode(stream.encode()).decode()
-                proxy = f"{PROXY_PREFIX}{encoded}.m3u8"
-
-                lines.append(extinf)
                 lines.extend(VLC_HEADERS)
-                lines.append(proxy)
+                encoded = base64.b64encode(stream.encode()).decode()
+                lines.append(f"{PROXY_PREFIX}{encoded}.m3u8")
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
-        fp.write("\n".join(lines) + "\n")
-    
-    logging.info("Playlist written to %s (%d events, %d EPG matches %.1f%%)", 
-                 OUTPUT_FILE, total_entries, epg_matches, 
-                 (epg_matches/total_entries*100) if total_entries > 0 else 0)
+        fp.write('\n'.join(lines) + '\n')
 
-def main():
+    pct = (epg_hits / total * 100) if total else 0
+    logging.info("Playlist written: %s  (%d items, %d matched EPG  %.1f%%)",
+                 OUTPUT_FILE, total, epg_hits, pct)
+
+
+# ╭────────────────────────────── main ───────────────────────────╮
+def main() -> None:
     ap = argparse.ArgumentParser(description="Build live-events playlist with smart EPG matching")
-    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true", help="verbose / debug logging")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -438,14 +440,21 @@ def main():
         format="%(levelname)s │ %(message)s",
     )
 
+    logging.info("Fetching schedule …")
     schedule = get_schedule()
-    chan_ids = extract_channel_ids(schedule)
+
+    chan_ids  = extract_channel_ids(schedule)
     stream_map = build_stream_map(chan_ids)
 
-    with requests.Session() as session:
-        logo_index = build_comprehensive_logo_index(session)
-        epg_lookup = download_epg_ids_from_txt(session)
-        make_playlist(schedule, stream_map, logo_index, epg_lookup)
+    with requests.Session() as s:
+        logo_index = build_logo_index(s)
+        epg_lookup = download_epg_ids(s)
+
+    make_playlist(schedule, stream_map, logo_index, epg_lookup)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
