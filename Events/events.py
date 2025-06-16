@@ -16,7 +16,7 @@ import requests
 
 # ─── constants ──────────────────────────────────────────────
 SCHEDULE_URL = "https://daddylive.dad/schedule/schedule-generated.php"
-PROXY_PREFIX = "https://josh9456-myproxy.hf.space/watch/"
+PROXY_PREFIX = "https://josh9456-ddproxy.hf.space/watch/"
 OUTPUT_FILE  = "schedule_playlist.m3u8"
 
 # Use the lightweight text file for ID mapping, XML for TiviMate EPG data
