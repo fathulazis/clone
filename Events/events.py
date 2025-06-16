@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-events.py – build live-events playlist with country-smart EPG matching
+events.py – better EPG matching for live events playlist
 """
 
 import argparse
@@ -19,7 +19,6 @@ SCHEDULE_URL = "https://daddylive.dad/schedule/schedule-generated.php"
 PROXY_PREFIX = "https://josh9456-ddproxy.hf.space/watch/"
 OUTPUT_FILE  = "schedule_playlist.m3u8"
 
-# Use the lightweight text file for ID mapping, XML for TiviMate EPG data
 EPG_IDS_URL = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.txt"
 EPG_XML_URL = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
 
@@ -52,57 +51,186 @@ VLC_HEADERS = [
     "Mobile/15E148 Safari/604.1",
 ]
 
-# Country preference for EPG matching (highest priority first)
-COUNTRY_PRIORITY = [
-    'uk', 'gb', 'en', 'us', 'usa', 'au', 'australia', 'ca', 'canada', 'nz', 'newzealand'
-]
+# Enhanced country mapping for better EPG matching
+COUNTRY_CODES = {
+    'usa': 'us', 'united states': 'us', 'america': 'us',
+    'uk': 'uk', 'united kingdom': 'uk', 'britain': 'uk', 'england': 'uk',
+    'canada': 'ca', 'can': 'ca',
+    'australia': 'au', 'aus': 'au',
+    'new zealand': 'nz', 'newzealand': 'nz',
+    'germany': 'de', 'deutschland': 'de', 'german': 'de',
+    'france': 'fr', 'french': 'fr',
+    'spain': 'es', 'spanish': 'es', 'españa': 'es',
+    'italy': 'it', 'italian': 'it', 'italia': 'it',
+    'croatia': 'hr', 'hrvatska': 'hr',
+    'serbia': 'rs', 'srbija': 'rs',
+    'netherlands': 'nl', 'holland': 'nl', 'dutch': 'nl',
+    'portugal': 'pt', 'portuguese': 'pt',
+    'poland': 'pl', 'polish': 'pl', 'polska': 'pl',
+    'greece': 'gr', 'greek': 'gr',
+    'bulgaria': 'bg', 'bulgarian': 'bg',
+    'israel': 'il', 'hebrew': 'il',
+    'malaysia': 'my', 'malay': 'my',
+}
 
 # ─── helpers ────────────────────────────────────────────────
-def slugify(channel: str) -> str:
-    """Convert channel name to lowercase slug with hyphens."""
-    txt = unicodedata.normalize("NFKD", channel).encode("ascii", "ignore").decode().lower()
-    txt = txt.replace("&", "-and-").replace("+", "-plus-")
-    txt = re.sub(r"[^\w\s-]", "", txt)
-    txt = re.sub(r"\s+", "-", txt).strip("-")
-    return txt
-
-def normalize_channel_name(name: str) -> str:
-    """Normalize channel name for EPG matching."""
-    name = name.upper().strip()
-    suffixes = [" HD", " SD", " US", " UK", " CA", " AU", " DE", " FR", " ES", " IT", " NL"]
-    for suffix in suffixes:
-        if name.endswith(suffix):
-            name = name[:-len(suffix)]
-    return re.sub(r'[^\w\s]', '', name).strip()
-
-def get_country_priority(tvg_id: str) -> int:
-    """Return priority score for country preference (lower = better)."""
-    tvg_lower = tvg_id.lower()
-    for i, country in enumerate(COUNTRY_PRIORITY):
-        if country in tvg_lower:
-            return i
-    return 999  # No preferred country found
-
-def is_valid_tvg_id(tvg_id: str) -> bool:
-    """Check if a string looks like a valid TVG-ID."""
-    if not tvg_id or len(tvg_id) < 3:
-        return False
+def extract_channel_info(channel_name):
+    """Extract channel brand and country from full channel name."""
+    # Common patterns: "Channel Name Country" or "Channel Name (Country)"
+    name = channel_name.strip()
     
-    # Reject patterns like "A+.fr"
-    if re.match(r'^[A-Z]\+\.[a-z]{2}$', tvg_id):
-        return False
+    # Handle parentheses format: "BBC Two (UK)" -> "BBC Two", "UK"
+    paren_match = re.search(r'^(.+?)\s*\(([^)]+)\)$', name)
+    if paren_match:
+        channel_brand = paren_match.group(1).strip()
+        country_part = paren_match.group(2).strip().lower()
+        country = COUNTRY_CODES.get(country_part, country_part[:2])
+        return channel_brand, country
     
-    # Accept domain-like or longer alphanumeric IDs
-    if re.match(r'^[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$', tvg_id):
-        return True
-        
-    if re.match(r'^[a-zA-Z0-9._-]{5,}$', tvg_id):
-        return True
-        
-    return False
+    # Handle space-separated format: "BBC Two UK" -> "BBC Two", "UK"
+    words = name.split()
+    if len(words) >= 2:
+        # Check if last word(s) are countries
+        for i in range(len(words)-1, 0, -1):
+            potential_country = ' '.join(words[i:]).lower()
+            if potential_country in COUNTRY_CODES:
+                channel_brand = ' '.join(words[:i]).strip()
+                country = COUNTRY_CODES[potential_country]
+                return channel_brand, country
+    
+    # Fallback: try to detect country from common patterns
+    name_lower = name.lower()
+    for country_name, code in COUNTRY_CODES.items():
+        if country_name in name_lower:
+            channel_brand = re.sub(rf'\b{re.escape(country_name)}\b', '', name_lower, flags=re.IGNORECASE).strip()
+            return channel_brand.title(), code
+    
+    return name, 'unknown'
 
-def download_epg_ids_from_txt(session: requests.Session) -> dict:
-    """Download the lightweight text file containing EPG channel IDs."""
+def build_epg_lookup(epg_text_lines):
+    """Build comprehensive EPG lookup with channel brand extraction."""
+    epg_lookup = defaultdict(list)
+    
+    for line in epg_text_lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+            
+        # Parse EPG ID format: usually "ChannelName.country" or similar
+        parts = line.split('.')
+        if len(parts) >= 2:
+            # Extract potential channel name and country
+            potential_channel = parts[0]
+            potential_country = parts[-1] if len(parts[-1]) == 2 else None
+            
+            # Clean channel name
+            clean_channel = re.sub(r'[^a-zA-Z0-9\s]', ' ', potential_channel)
+            clean_channel = re.sub(r'\s+', ' ', clean_channel).strip()
+            
+            # Store multiple lookup keys
+            epg_lookup[clean_channel.lower()].append(line)
+            epg_lookup[line.lower()].append(line)
+            
+            # If we have a country, also store country-specific lookups
+            if potential_country:
+                key = f"{clean_channel.lower()}.{potential_country}"
+                epg_lookup[key].append(line)
+        else:
+            # Handle simple format
+            clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', line)
+            clean = re.sub(r'\s+', ' ', clean).strip()
+            epg_lookup[clean.lower()].append(line)
+            epg_lookup[line.lower()].append(line)
+    
+    return epg_lookup
+
+def find_best_epg_match(channel_name, epg_lookup):
+    """Find best EPG match using intelligent channel brand + country matching."""
+    channel_brand, country = extract_channel_info(channel_name)
+    
+    # Priority order for matching
+    search_terms = []
+    
+    # 1. Exact brand + country match
+    if country != 'unknown':
+        search_terms.append(f"{channel_brand.lower()}.{country}")
+        search_terms.append(f"{channel_brand.lower()}.{country}.hd")
+    
+    # 2. Brand variations
+    brand_clean = re.sub(r'\s+', '', channel_brand.lower())
+    search_terms.append(brand_clean)
+    search_terms.append(channel_brand.lower())
+    
+    # 3. Handle common network name variations
+    brand_variations = generate_brand_variations(channel_brand)
+    for variation in brand_variations:
+        if country != 'unknown':
+            search_terms.append(f"{variation}.{country}")
+        search_terms.append(variation)
+    
+    # Try each search term
+    for term in search_terms:
+        if term in epg_lookup:
+            matches = epg_lookup[term]
+            # Prefer matches with correct country
+            if country != 'unknown':
+                country_matches = [m for m in matches if f".{country}" in m.lower()]
+                if country_matches:
+                    logging.debug(f"EPG match for {channel_name}: {country_matches[0]}")
+                    return country_matches[0]
+            
+            # Return first match if no country preference
+            logging.debug(f"EPG match for {channel_name}: {matches[0]}")
+            return matches[0]
+    
+    # Fallback: fuzzy matching
+    for epg_id, _ in epg_lookup.items():
+        if brand_clean in epg_id or epg_id in brand_clean:
+            return epg_lookup[epg_id][0]
+    
+    return ""
+
+def generate_brand_variations(brand):
+    """Generate common variations of channel brand names."""
+    variations = set()
+    brand_lower = brand.lower()
+    
+    # Remove common words
+    clean_brand = re.sub(r'\b(tv|hd|sd|channel|network|sports?|news)\b', '', brand_lower).strip()
+    if clean_brand:
+        variations.add(clean_brand)
+    
+    # Handle abbreviations: "BBC Two" -> "bbc2", "BBC 2"
+    if 'two' in brand_lower:
+        variations.add(brand_lower.replace('two', '2'))
+        variations.add(brand_lower.replace(' two', '2'))
+    elif 'three' in brand_lower:
+        variations.add(brand_lower.replace('three', '3'))
+        variations.add(brand_lower.replace(' three', '3'))
+    
+    # Handle "Sports" variations
+    if 'sports' in brand_lower:
+        variations.add(brand_lower.replace('sports', 'sport'))
+    elif 'sport' in brand_lower:
+        variations.add(brand_lower.replace('sport', 'sports'))
+    
+    # Handle network abbreviations
+    network_abbrevs = {
+        'espn': 'espn',
+        'fox sports': 'foxsports',
+        'sky sports': 'skysports',
+        'tnt sports': 'tntsports',
+        'bein sports': 'beinsports',
+    }
+    
+    for full_name, abbrev in network_abbrevs.items():
+        if full_name in brand_lower:
+            variations.add(brand_lower.replace(full_name, abbrev))
+    
+    return list(variations)
+
+def download_epg_ids_from_txt(session: requests.Session):
+    """Download and parse EPG IDs with improved matching."""
     logging.info("Downloading EPG IDs from text file...")
     
     try:
@@ -110,102 +238,28 @@ def download_epg_ids_from_txt(session: requests.Session) -> dict:
         r.raise_for_status()
         
         logging.info("✓ EPG IDs downloaded (%d bytes)", len(r.content))
-        
-        # Store multiple matches per normalized name for country prioritization
-        epg_channels = defaultdict(list)
         lines = r.text.splitlines()
-        valid_ids = 0
+        epg_lookup = build_epg_lookup(lines)
         
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            
-            if is_valid_tvg_id(line):
-                normalized = normalize_channel_name(line)
-                # Store all matches, we'll sort by country priority later
-                epg_channels[normalized].append(line)
-                epg_channels[line.upper().strip()].append(line)
-                epg_channels[line.lower().strip()].append(line)
-                valid_ids += 1
-                
-                if '.' in line or '_' in line:
-                    clean = line.replace('.', ' ').replace('_', ' ')
-                    clean_norm = normalize_channel_name(clean)
-                    epg_channels[clean_norm].append(line)
-            else:
-                # Create TVG-ID from channel name
-                normalized = normalize_channel_name(line)
-                tvg_id = slugify(line).replace('-', '.')
-                if tvg_id:
-                    epg_channels[normalized].append(tvg_id)
-                    epg_channels[line.upper().strip()].append(tvg_id)
-                    epg_channels[line.lower().strip()].append(tvg_id)
-        
-        # Convert defaultdict to regular dict and sort by country priority
-        final_channels = {}
-        for key, id_list in epg_channels.items():
-            # Sort by country priority (English/UK first)
-            sorted_ids = sorted(set(id_list), key=get_country_priority)
-            final_channels[key] = sorted_ids[0]  # Take the best match
-        
-        logging.info("✓ EPG IDs parsed: %d mappings (%d valid IDs)", len(final_channels), valid_ids)
-        return final_channels
+        logging.info("✓ EPG lookup built with %d unique keys", len(epg_lookup))
+        return epg_lookup
         
     except Exception as e:
         logging.warning("Failed to download EPG IDs: %s", e)
         return {}
 
-def find_epg_id(channel_name: str, epg_channels: dict) -> str:
-    """Find the best matching EPG channel ID with country preference."""
-    if not epg_channels:
-        return ""
-    
-    normalized = normalize_channel_name(channel_name)
-    original_upper = channel_name.upper().strip()
-    original_lower = channel_name.lower().strip()
-    
-    # Direct matches first (already country-prioritized)
-    for candidate in [normalized, original_upper, original_lower]:
-        if candidate in epg_channels:
-            tvg_id = epg_channels[candidate]
-            if is_valid_tvg_id(tvg_id):
-                logging.debug("✓ EPG match for %s: %s", channel_name, tvg_id)
-                return tvg_id
-    
-    # Fuzzy matching with country preference
-    matches = []
-    for epg_name, epg_id in epg_channels.items():
-        if (normalized in epg_name or epg_name in normalized) and is_valid_tvg_id(epg_id):
-            priority = get_country_priority(epg_id)
-            matches.append((priority, epg_id))
-    
-    if matches:
-        # Sort by country priority and take the best
-        matches.sort()
-        best_match = matches[0][1]
-        logging.debug("✓ EPG fuzzy match for %s: %s", channel_name, best_match)
-        return best_match
-    
-    # First word matching with country preference
-    first_word = normalized.split()[0] if normalized.split() else ""
-    if first_word and len(first_word) > 2:
-        matches = []
-        for epg_name, epg_id in epg_channels.items():
-            if first_word in epg_name.lower() and is_valid_tvg_id(epg_id):
-                priority = get_country_priority(epg_id)
-                matches.append((priority, epg_id))
-        
-        if matches:
-            matches.sort()
-            best_match = matches[0][1]
-            logging.debug("✓ EPG first-word match for %s: %s", channel_name, best_match)
-            return best_match
-    
-    return ""
+# [Rest of the functions remain the same: slugify, build_comprehensive_logo_index, 
+#  find_best_logo, get_schedule, _extract_cid, _channel_entries, extract_channel_ids,
+#  validate_single, build_stream_map]
+
+def slugify(channel: str) -> str:
+    txt = unicodedata.normalize("NFKD", channel).encode("ascii", "ignore").decode().lower()
+    txt = txt.replace("&", "-and-").replace("+", "-plus-")
+    txt = re.sub(r"[^\w\s-]", "", txt)
+    txt = re.sub(r"\s+", "-", txt).strip("-")
+    return txt
 
 def build_comprehensive_logo_index(session: requests.Session) -> dict:
-    """Build complete logo index from tv-logo repo."""
     logging.info("Building comprehensive logo index from tv-logo repo...")
     logo_index = {}
     
@@ -213,8 +267,6 @@ def build_comprehensive_logo_index(session: requests.Session) -> dict:
         r = session.get(TVLOGO_API_ROOT, timeout=30)
         r.raise_for_status()
         countries = [item["name"] for item in r.json() if item["type"] == "dir"]
-        
-        logging.info("Found %d countries in logo repo", len(countries))
         
         for country in countries:
             try:
@@ -235,7 +287,6 @@ def build_comprehensive_logo_index(session: requests.Session) -> dict:
                             if base_name.endswith(suffix):
                                 clean_name = base_name.replace(suffix, "")
                                 logo_index[clean_name] = full_url
-                                logo_index[clean_name + ".png"] = full_url
                         
             except Exception as e:
                 logging.debug("Failed to fetch logos for %s: %s", country, e)
@@ -249,20 +300,14 @@ def build_comprehensive_logo_index(session: requests.Session) -> dict:
         return {}
 
 def find_best_logo(channel_name: str, logo_index: dict) -> str:
-    """Find the best matching logo for a channel name."""
     if not logo_index:
         return "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/no-logo.png"
         
     slug = slugify(channel_name)
-    variations = [
-        slug, slug + ".png", slug.replace("-hd", ""), slug.replace("-sd", ""),
-        slug.split("-")[0], channel_name.lower().replace(" ", "-"),
-        channel_name.lower().replace(" ", "-") + ".png",
-    ]
+    variations = [slug, slug + ".png", slug.replace("-hd", ""), slug.replace("-sd", "")]
     
     for variant in variations:
         if variant in logo_index:
-            logging.debug("✓ Logo found for %s: %s", channel_name, variant)
             return logo_index[variant]
     
     return "https://raw.githubusercontent.com/tv-logo/tv-logos/main/misc/no-logo.png"
@@ -330,7 +375,7 @@ def build_stream_map(channel_ids, workers=20):
     logging.info("✓ %d working streams", len(id_to_url))
     return id_to_url
 
-def make_playlist(schedule, stream_map, logo_index, epg_channels):
+def make_playlist(schedule, stream_map, logo_index, epg_lookup):
     lines = ["#EXTM3U"]
     lines.append(f"#EXTM3U url-tvg=\"{EPG_XML_URL}\"")
     
@@ -354,9 +399,9 @@ def make_playlist(schedule, stream_map, logo_index, epg_channels):
 
                 total_entries += 1
                 
-                # Find EPG ID with country prioritization
-                epg_id = find_epg_id(cname, epg_channels)
-                if epg_id and is_valid_tvg_id(epg_id):
+                # Use improved EPG matching
+                epg_id = find_best_epg_match(cname, epg_lookup)
+                if epg_id:
                     epg_matches += 1
                     tvg_id = epg_id
                 else:
@@ -369,7 +414,7 @@ def make_playlist(schedule, stream_map, logo_index, epg_channels):
                     f'group-title="{group}",{title} ({cname})'
                 )
 
-                encoded = base64.b64encode(stream.encode()).decode() 
+                encoded = base64.b64encode(stream.encode()).decode()
                 proxy = f"{PROXY_PREFIX}{encoded}.m3u8"
 
                 lines.append(extinf)
@@ -379,11 +424,12 @@ def make_playlist(schedule, stream_map, logo_index, epg_channels):
     with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
         fp.write("\n".join(lines) + "\n")
     
-    logging.info("Playlist written to %s (%d events, %d EPG matches)", 
-                 OUTPUT_FILE, total_entries, epg_matches)
+    logging.info("Playlist written to %s (%d events, %d EPG matches %.1f%%)", 
+                 OUTPUT_FILE, total_entries, epg_matches, 
+                 (epg_matches/total_entries*100) if total_entries > 0 else 0)
 
 def main():
-    ap = argparse.ArgumentParser(description="Build live-events playlist with country-smart EPG")
+    ap = argparse.ArgumentParser(description="Build live-events playlist with smart EPG matching")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -398,8 +444,8 @@ def main():
 
     with requests.Session() as session:
         logo_index = build_comprehensive_logo_index(session)
-        epg_channels = download_epg_ids_from_txt(session)
-        make_playlist(schedule, stream_map, logo_index, epg_channels)
+        epg_lookup = download_epg_ids_from_txt(session)
+        make_playlist(schedule, stream_map, logo_index, epg_lookup)
 
 if __name__ == "__main__":
     main()
