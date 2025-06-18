@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-PROXY_PREFIX = 'https://josh9456-ddproxy.hf.space/watch/'
+PROXY_PREFIX = 'https://myexample.com/watch/'
 PREMIUM_RE   = re.compile(r'premium(\d+)/mono\.m3u8')
 
 URL_TEMPLATES = [
