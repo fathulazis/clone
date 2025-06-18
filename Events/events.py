@@ -22,7 +22,7 @@ import requests
 
 # ═════════════════════════════ constants ═══════════════════════════════════
 SCHEDULE_URL   = "https://daddylive.dad/schedule/schedule-generated.php"
-PROXY_PREFIX   = "https://josh9456-ddproxy.hf.space/watch/"
+PROXY_PREFIX   = "https://myexample.com/watch/"
 OUTPUT_FILE    = "schedule_playlist.m3u8"
 
 EPG_IDS_URL    = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.txt"
