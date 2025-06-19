@@ -1,4 +1,4 @@
-# .github/workflows/Test_Update_playlist.yml
+# .github/workflows/Test_Channels_Updater.yml
 name: Update Playlist
 
 on:
