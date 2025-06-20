@@ -19,7 +19,7 @@ URL_TEMPLATES = [
     "https://ddy6new.newkso.ru/ddy6/premium{num}/mono.m3u8"
 ]
 
-INPUT_PLAYLIST  = "tivimate_playlist.m3u8"
+INPUT_PLAYLIST  = "test_tivimate_playlist.m3u8"
 VALID_LINKS_OUT = "links.m3u8"
 
 
@@ -158,7 +158,7 @@ def rewrite_streams(src=INPUT_PLAYLIST, proxy_map=None):
 # -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Refresh tivimate_playlist.m3u8 with working proxy links")
+        description="Refresh test_tivimate_playlist.m3u8 with working proxy links")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="show DEBUG-level detail (per-URL checks, replacements)")
     args = parser.parse_args()
