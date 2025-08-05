@@ -58,8 +58,7 @@ def validate_links(src=INPUT_PLAYLIST, out=VALID_LINKS_OUT, workers=10):
         headers = {
             'User-Agent': 'Mozilla/5.0',
             'Origin': 'https://jxoplay.xyz',
-            'Referer': 'https://jxoplay.xyz
-/'
+            'Referer': 'https://jxoplay.xyz/'
         }
         for attempt in range(1, 4):
             try:
