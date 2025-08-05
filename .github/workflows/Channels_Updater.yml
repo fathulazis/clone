@@ -31,7 +31,7 @@ jobs:
       - name: Run main script
         run: |
           cd all_channels
-          python main.py
+          python main.py -v
 
       - name: Commit and push changes
         run: |
