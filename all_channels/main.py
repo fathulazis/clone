@@ -1,15 +1,14 @@
-# main.py  – validate links, rebuild proxy URLs, rewrite tivimate_playlist.m3u8
+# main.py – validate links, rebuild direct URLs, rewrite tivimate_playlist.m3u8
+
 import argparse
-import base64
 import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from collections import defaultdict
 import requests
 
-PROXY_PREFIX = 'https://josh9456-ddproxy.hf.space/watch/'
-PREMIUM_RE   = re.compile(r'premium(\d+)/mono\.m3u8')
+PREMIUM_RE = re.compile(r'premium(\d+)/mono\.m3u8')
 
 URL_TEMPLATES = [
     "https://nfsnew.newkso.ru/nfs/premium{num}/mono.m3u8",
@@ -19,48 +18,52 @@ URL_TEMPLATES = [
     "https://ddy6new.newkso.ru/ddy6/premium{num}/mono.m3u8"
 ]
 
-INPUT_PLAYLIST  = "tivimate_playlist.m3u8"
+INPUT_PLAYLIST = "tivimate_playlist.m3u8"
 VALID_LINKS_OUT = "links.m3u8"
 
+# -----------------------------------------------------------------------------
+
+# 1. Validate every possible premium URL extracted from tivimate_playlist.m3u8
 
 # -----------------------------------------------------------------------------
-# 1.  Validate every possible premium URL extracted from tivimate_playlist.m3u8
-# -----------------------------------------------------------------------------
+
 def validate_links(src=INPUT_PLAYLIST, out=VALID_LINKS_OUT, workers=10):
     log = logging.getLogger("validate_links")
     log.info("Stage 1 ▸ scanning %s", src)
 
-    decoded_urls = []
+    current_urls = []
     with open(src, encoding="utf-8") as fin:
-        for line in fin:
-            if line.startswith(PROXY_PREFIX):
-                try:
-                    b64 = line.split('/watch/')[1].split('.m3u8')[0]
-                    decoded = base64.b64decode(b64).decode().strip()
-                    decoded_urls.append(decoded)
-                    log.debug("decoded ⇒ %s", decoded)
-                except Exception as e:
-                    log.debug("base64 decode failed: %s", e)
+        lines = fin.read().splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("#EXTINF") and i + 1 < len(lines):
+            stream = lines[i + 1].strip()
+            if PREMIUM_RE.search(stream):
+                current_urls.append(stream)
+                log.debug("found ⇒ %s", stream)
+            i += 2
+        else:
+            i += 1
 
-    ids = {m.group(1) for u in decoded_urls if (m := PREMIUM_RE.search(u))}
+    ids = {m.group(1) for u in current_urls if (m := PREMIUM_RE.search(u))}
     if not ids:
         log.error("No premium{num} identifiers found – aborting.")
         raise SystemExit(1)
 
     log.info("Found %d unique premium IDs: %s", len(ids), sorted(ids))
-
     candidates = [tpl.format(num=i) for i in ids for tpl in URL_TEMPLATES]
     log.info("Generated %d candidate URLs to test", len(candidates))
 
     def check(url):
         headers = {
             'User-Agent': 'Mozilla/5.0',
-            'Origin':   'https://lefttoplay.xyz',
-            'Referer':  'https://lefttoplay.xyz/'
+            'Origin': 'https://jxoplay.xyz',
+            'Referer': 'https://jxoplay.xyz
+/'
         }
         for attempt in range(1, 4):
             try:
-                log.debug("HEAD  %s  (try %d)", url, attempt)
+                log.debug("HEAD %s (try %d)", url, attempt)
                 r = requests.head(url, headers=headers, timeout=10, allow_redirects=True)
                 if r.status_code == 200:
                     return url
@@ -71,7 +74,7 @@ def validate_links(src=INPUT_PLAYLIST, out=VALID_LINKS_OUT, workers=10):
                 if r.status_code == 404:
                     return None
                 # fallback to GET for odd responses
-                log.debug("GET   %s  (try %d)", url, attempt)
+                log.debug("GET %s (try %d)", url, attempt)
                 r = requests.get(url, headers=headers, timeout=10, stream=True, allow_redirects=True)
                 if r.status_code == 200:
                     return url
@@ -97,51 +100,55 @@ def validate_links(src=INPUT_PLAYLIST, out=VALID_LINKS_OUT, workers=10):
     log.info("Stage 1 complete – %d valid URLs written to %s", len(valid), out)
     return valid
 
+# -----------------------------------------------------------------------------
+
+# 2. Build {ID → list of valid direct links} mapping from the validated URLs
 
 # -----------------------------------------------------------------------------
-# 2.  Build {original stream → new proxy link} mapping from the validated URLs
-# -----------------------------------------------------------------------------
-def build_proxy_map(valid_links):
-    log = logging.getLogger("build_proxy_map")
-    proxy_map = {}
+
+def build_map(valid_links):
+    log = logging.getLogger("build_map")
+    id_to_valids = defaultdict(list)
     for link in valid_links:
-        encoded = base64.b64encode(link.encode()).decode()
-        proxy_map[link] = f"{PROXY_PREFIX}{encoded}.m3u8"
-        log.debug("%s  →  %s", link, proxy_map[link])
-    log.info("Stage 2 complete – proxy map has %d entries", len(proxy_map))
-    return proxy_map
-
+        m = PREMIUM_RE.search(link)
+        if m:
+            id_ = m.group(1)
+            id_to_valids[id_].append(link)
+            log.debug("%s → ID %s", link, id_)
+    log.info("Stage 2 complete – %d IDs with valid links", len(id_to_valids))
+    return id_to_valids
 
 # -----------------------------------------------------------------------------
-# 3.  Rewrite only stream lines inside tivimate_playlist.m3u8
+
+# 3. Rewrite only stream lines inside tivimate_playlist.m3u8 if a new link is found
+
 # -----------------------------------------------------------------------------
-def rewrite_streams(src=INPUT_PLAYLIST, proxy_map=None):
+
+def rewrite_streams(src=INPUT_PLAYLIST, id_to_valids=None):
     log = logging.getLogger("rewrite_streams")
-
     lines = open(src, encoding="utf-8").read().splitlines()
     out_lines, replaced = [], 0
     i = 0
-
     while i < len(lines):
         line = lines[i]
         if line.startswith("#EXTINF") and i + 1 < len(lines):
-            out_lines.append(line)             # keep EXTINF
+            out_lines.append(line)  # keep EXTINF
             stream = lines[i + 1].strip()
-            decoded = None
-
-            if stream.startswith(PROXY_PREFIX):
-                try:
-                    b64 = stream.split('/watch/')[1].split('.m3u8')[0]
-                    decoded = base64.b64decode(b64).decode().strip()
-                except Exception:
-                    pass
-
-            if decoded and decoded in proxy_map:
-                out_lines.append(proxy_map[decoded])
-                log.debug("Replaced %s → %s", stream, proxy_map[decoded])
-                replaced += 1
-            else:
-                out_lines.append(stream)
+            new_stream = stream  # default: keep
+            m = PREMIUM_RE.search(stream)
+            if m:
+                id_ = m.group(1)
+                if id_ in id_to_valids:
+                    valids = id_to_valids[id_]
+                    if stream not in valids and valids:  # current invalid, but new valid exists
+                        new_stream = valids[0]  # pick the first valid one
+                        log.debug("Replaced %s → %s", stream, new_stream)
+                        replaced += 1
+                    else:
+                        log.debug("Kept valid %s", stream)
+                else:
+                    log.debug("No valid links for ID %s, kept %s", id_, stream)
+            out_lines.append(new_stream)
             i += 2
         else:
             out_lines.append(line)
@@ -152,13 +159,15 @@ def rewrite_streams(src=INPUT_PLAYLIST, proxy_map=None):
 
     log.info("Stage 3 complete – %d stream URLs replaced", replaced)
 
+# -----------------------------------------------------------------------------
+
+# entry-point
 
 # -----------------------------------------------------------------------------
-# entry-point
-# -----------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Refresh tivimate_playlist.m3u8 with working proxy links")
+        description="Refresh tivimate_playlist.m3u8 with working direct links")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="show DEBUG-level detail (per-URL checks, replacements)")
     args = parser.parse_args()
@@ -167,14 +176,11 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s │ %(name)s │ %(message)s")
 
-    logging.info("▶️  Starting playlist refresh (verbose=%s)", args.verbose)
-
+    logging.info("▶️ Starting playlist refresh (verbose=%s)", args.verbose)
     valid = validate_links()
-    proxy_map = build_proxy_map(valid)
-    rewrite_streams(proxy_map=proxy_map)
-
-    logging.info("✅  Done – playlist refreshed")
-
+    id_to_valids = build_map(valid)
+    rewrite_streams(id_to_valids=id_to_valids)
+    logging.info("✅ Done – playlist refreshed")
 
 if __name__ == "__main__":
     main()
